@@ -101,6 +101,20 @@
   }
   .mapfoot button:hover{color:var(--ember)}
 
+  /* ---------- pet companion ---------- */
+  .pet{
+    border:1px solid var(--line);border-radius:8px;background:var(--panel);
+    padding:.7rem .8rem .6rem;margin:0 .1rem 1.2rem;
+  }
+  .pet-top{display:flex;align-items:baseline;gap:.45rem;flex-wrap:wrap}
+  .pet-name{font-family:var(--mono);font-weight:700;font-size:.9rem;color:var(--gold)}
+  .pet-rename{background:none;border:none;color:#5c6b5f;cursor:pointer;font-family:var(--mono);font-size:.68rem;padding:0}
+  .pet-rename:hover{color:var(--text)}
+  .pet-stage{margin-left:auto;font-family:var(--mono);font-size:.6rem;letter-spacing:.14em;text-transform:uppercase;color:var(--leaf)}
+  .pet-art{margin:.35rem 0 .2rem}
+  .pet-art svg{display:block;width:100%;height:auto}
+  .pet-meta{font-family:var(--mono);font-size:.65rem;color:var(--text-dim);font-variant-numeric:tabular-nums;line-height:1.5}
+
   /* ---------- main ---------- */
   main{padding:1.6rem 1.8rem 4rem;max-width:880px}
   @media (max-width:860px){main{padding:1.2rem 1rem 3rem}}
@@ -1054,7 +1068,8 @@ function runPython(src){
    ===================================================================== */
 const CHAPTERS=[
   'I · Landfall','II · Naming Things','III · Forks in the Trail',
-  'IV · The Loop Lagoon',"V · The Toolmaker's Ridge"
+  'IV · The Loop Lagoon',"V · The Toolmaker's Ridge",
+  'VI · The Echoing Caves','VII · The While Wilds','VIII · The Deep Jungle'
 ];
 
 const LEVELS=[
@@ -1279,20 +1294,218 @@ Hail, Grace!</code></pre>`,
          'Below the function (unindented): print(greet("Ada")) then print(greet("Grace")).'],
   solution:'def greet(name):\n    return f"Hail, {name}!"\n\nprint(greet("Ada"))\nprint(greet("Grace"))'
 },
+// ---- Chapter VI ----
+{
+  id:'6-1',ch:5,xp:22,title:'Reading the runes',
+  brief:`<p>Beyond the ridge, the cave walls are carved with old runes. A string is a <em>sequence</em> — every character has a numbered position, starting at <strong>0</strong>. Square brackets pluck one out, and negative numbers count from the end:</p>
+<pre><code>word = "TRAIL"
+print(word[0])    # T
+print(word[-1])   # L</code></pre>`,
+  goal:`Print the first character of <code>rune</code>, then the last one, on separate lines. Expected output:
+<pre><code>P
+N</code></pre>`,
+  starter:'rune = "PYTHON"\n# First and last...\n',
+  expected:'P\nN',
+  require:[{re:/\[\s*0\s*\]/,msg:'Get the first character with [0].'},
+           {re:/\[\s*-\s*1\s*\]/,msg:'Get the last character with [-1] — negative indexes count from the end.'}],
+  hints:['The first character is rune[0] — positions start at 0, not 1.',
+         'print(rune[0]) then print(rune[-1]).'],
+  solution:'rune = "PYTHON"\nprint(rune[0])\nprint(rune[-1])'
+},
+{
+  id:'6-2',ch:5,xp:22,title:'Shout into the dark',
+  brief:`<p>The caves answer back. Strings carry their own tools — <strong>methods</strong>, called with a dot: <code>"hi".upper()</code> gives <code>"HI"</code>. And just like numbers, strings multiply: <code>"ha" * 3</code> is <code>"hahaha"</code>.</p>`,
+  goal:`Print <code>cry</code> in uppercase, then print it repeated 3 times. Expected output:
+<pre><code>ECHO
+echoechoecho</code></pre>`,
+  starter:'cry = "echo"\n# Shout, then let it echo\n',
+  expected:'ECHO\nechoechoecho',
+  require:[{re:/\.upper\s*\(\s*\)/,msg:'Use the .upper() method for the shout.'},
+           {re:/\*\s*3/,msg:'Repeat the string with * 3.'}],
+  hints:['print(cry.upper()) — the parentheses matter; methods are called like functions.',
+         'print(cry * 3) glues three copies together with nothing in between.'],
+  solution:'cry = "echo"\nprint(cry.upper())\nprint(cry * 3)'
+},
+{
+  id:'6-3',ch:5,xp:22,title:'The cipher wall',
+  brief:`<p>A warning is scrawled on the wall — but one word is wrong. <code>.replace(old, new)</code> swaps text, and the <code>in</code> operator asks whether one string hides inside another, answering <code>True</code> or <code>False</code>:</p>
+<pre><code>"sun" in "sunset"    # True</code></pre>`,
+  goal:`Print the message with <code>"flee"</code> replaced by <code>"seek"</code>, then print whether <code>"cave"</code> is in the original message. Expected output:
+<pre><code>seek the cave
+True</code></pre>`,
+  starter:'message = "flee the cave"\n# Fix the word, then check for "cave"\n',
+  expected:'seek the cave\nTrue',
+  require:[{re:/\.replace\s*\(/,msg:'Swap the word with .replace("flee", "seek").'},
+           {re:/\bin\b/,msg:'Check membership with the in operator.'}],
+  hints:['print(message.replace("flee", "seek")) — replace returns a new string; the original is untouched.',
+         'print("cave" in message) — no quotes around True; the check produces it.'],
+  solution:'message = "flee the cave"\nprint(message.replace("flee", "seek"))\nprint("cave" in message)'
+},
+// ---- Chapter VII ----
+{
+  id:'7-1',ch:6,xp:25,title:'The rope bridge',
+  brief:`<p>A <code>for</code> loop runs a known number of times. A <code>while</code> loop runs <em>as long as its condition holds</em> — perfect when you don't know how many passes you'll need. Something inside the loop must move toward the end, or it never stops:</p>
+<pre><code>fuel = 2
+while fuel &gt; 0:
+    fuel -= 1     # shorthand for fuel = fuel - 1</code></pre>`,
+  goal:`Count the planks down from 3 to 1 with a while loop, then print <code>Crossed!</code> Expected output:
+<pre><code>3
+2
+1
+Crossed!</code></pre>`,
+  starter:'planks = 3\n# while there are planks left...\n',
+  expected:'3\n2\n1\nCrossed!',
+  require:[{re:/\bwhile\b/,msg:'Use a while loop.'},
+           {re:/-=|planks\s*=\s*planks\s*-/,msg:'Shrink planks inside the loop, or it runs forever.'}],
+  hints:['while planks > 0: — then, indented: print(planks) and planks -= 1.',
+         'print("Crossed!") goes after the loop, unindented.'],
+  solution:'planks = 3\nwhile planks > 0:\n    print(planks)\n    planks -= 1\nprint("Crossed!")'
+},
+{
+  id:'7-2',ch:6,xp:25,title:'Even stones only',
+  brief:`<p>The marsh crossing: only every second stepping stone is safe. The <code>%</code> (modulo) operator gives the <em>remainder</em> of a division — <code>7 % 2</code> is <code>1</code>. So a number is even exactly when <code>n % 2 == 0</code>.</p>`,
+  goal:`Loop 1 through 10 and print only the even numbers. Expected output:
+<pre><code>2
+4
+6
+8
+10</code></pre>`,
+  starter:'# Test each stone from 1 to 10\n',
+  expected:'2\n4\n6\n8\n10',
+  require:[{re:/%/,msg:'Use the % operator to test for evenness.'},
+           {re:/\bif\b/,msg:'Use an if inside the loop to filter.'}],
+  hints:['for n in range(1, 11): — then an if n % 2 == 0: inside it.',
+         'The print(n) is indented twice: it lives inside the if, which lives inside the for.'],
+  solution:'for n in range(1, 11):\n    if n % 2 == 0:\n        print(n)'
+},
+{
+  id:'7-3',ch:6,xp:25,title:'The chant of Fizz',
+  brief:`<p>Deep in the wilds you meet the oldest ritual in programming — the interview classic <strong>FizzBuzz</strong>. Count upward; for multiples of 3 chant <code>Fizz</code>, multiples of 5 chant <code>Buzz</code>, multiples of both chant <code>FizzBuzz</code>. The trap: check the <em>both</em> case first, or it can never be reached.</p>`,
+  goal:`For the numbers 1 through 15: print <code>FizzBuzz</code> if divisible by 3 and 5, else <code>Fizz</code> if divisible by 3, else <code>Buzz</code> if divisible by 5, else the number itself.`,
+  starter:'for n in range(1, 16):\n    # your chant here\n',
+  expected:'1\n2\nFizz\n4\nBuzz\nFizz\n7\n8\nFizz\nBuzz\n11\nFizz\n13\n14\nFizzBuzz',
+  require:[{re:/%/,msg:'Use % to test divisibility.'},
+           {re:/\belif\b/,msg:'Chain the cases with elif.'}],
+  hints:['Divisible by both 3 and 5 means divisible by 15 — test n % 15 == 0 first.',
+         'Four branches: if n % 15 == 0 / elif n % 3 == 0 / elif n % 5 == 0 / else print(n).'],
+  solution:'for n in range(1, 16):\n    if n % 15 == 0:\n        print("FizzBuzz")\n    elif n % 3 == 0:\n        print("Fizz")\n    elif n % 5 == 0:\n        print("Buzz")\n    else:\n        print(n)'
+},
+// ---- Chapter VIII ----
+{
+  id:'8-1',ch:7,xp:28,title:'The terraced falls',
+  brief:`<p>The waterfall descends in widening terraces. No new tools here — you already know that a loop hands you a growing number and that multiplying a string repeats it. Put the two together and shapes appear.</p>`,
+  goal:`Print a staircase of stars, 1 to 4 wide. Expected output:
+<pre><code>*
+**
+***
+****</code></pre>`,
+  starter:'# Each row is "*" times the row number\n',
+  expected:'*\n**\n***\n****',
+  require:[{re:/\bfor\b/,msg:'Build the rows with a loop.'},
+           {re:/["']\*["']\s*\*|\*\s*["']\*["']/,msg:'Multiply the "*" string by the loop number instead of printing each row by hand.'}],
+  hints:['for i in range(1, 5): gives you 1, 2, 3, 4.',
+         'Inside the loop: print("*" * i).'],
+  solution:'for i in range(1, 5):\n    print("*" * i)'
+},
+{
+  id:'8-2',ch:7,xp:28,title:'The tally keeper',
+  brief:`<p>The village tally keeper wants a reusable tool: hand it any list of words, get back how many are long ones. This is the accumulator pattern from the lagoon, wrapped inside a function — the shape of most real Python you'll ever write.</p>`,
+  goal:`Define <code>long_words(items)</code> that <em>returns</em> how many strings in the list have more than 4 letters, then print <code>long_words(gear)</code>. Expected output: <code>2</code>`,
+  starter:'def long_words(items):\n    # count items longer than 4 letters\n\ngear = ["fern", "orchid", "moss", "liana"]\nprint(long_words(gear))\n',
+  expected:'2',
+  require:[{re:/\bdef\s+long_words\s*\(/,msg:'Define the function: def long_words(items):'},
+           {re:/len\s*\(/,msg:'Measure each word with len().'},
+           {re:/\breturn\b/,msg:'Return the count from the function.'}],
+  hints:['Inside the function: start total = 0, loop for w in items:, and if len(w) > 4: add 1 to total.',
+         'return total goes at the end of the function — indented once, outside the loop.'],
+  solution:'def long_words(items):\n    total = 0\n    for w in items:\n        if len(w) > 4:\n            total += 1\n    return total\n\ngear = ["fern", "orchid", "moss", "liana"]\nprint(long_words(gear))'
+},
+{
+  id:'8-3',ch:7,xp:28,title:'The heart of the isles',
+  brief:`<p>The final chamber. Your journal holds the day-counts of every trek — and Python has built-ins that eat whole lists: <code>max()</code>, <code>min()</code>, and <code>sum()</code>. Weave the results into f-strings and file your last report.</p>`,
+  goal:`Using the <code>trek</code> list, print the three report lines. Expected output:
+<pre><code>peak: 19
+valley: 3
+total: 41</code></pre>`,
+  starter:'trek = [12, 7, 19, 3]\n# peak, valley, total\n',
+  expected:'peak: 19\nvalley: 3\ntotal: 41',
+  require:[{re:/f["']/,msg:'Format the report lines with f-strings.'},
+           {re:/max\s*\(|min\s*\(|sum\s*\(/,msg:'Let max(), min() and sum() do the work.'}],
+  hints:['max(trek) is 19, min(trek) is 3, sum(trek) is 41 — you can call them right inside the braces.',
+         'Each line is one print, e.g. print(f"peak: {max(trek)}").'],
+  solution:'trek = [12, 7, 19, 3]\nprint(f"peak: {max(trek)}")\nprint(f"valley: {min(trek)}")\nprint(f"total: {sum(trek)}")'
+},
 ];
 
-const RANKS=[[0,'Hatchling'],[30,'Deck Scout'],[70,'Pathfinder'],[120,'Trailblazer'],[180,'Ridge Ranger'],[225,'Pythonista']];
+const RANKS=[[0,'Hatchling'],[30,'Deck Scout'],[70,'Pathfinder'],[120,'Trailblazer'],[180,'Ridge Ranger'],[250,'Cave Delver'],[330,'Serpent Sage'],[450,'Pythonista']];
 const TOTAL_XP=LEVELS.reduce((a,l)=>a+l.xp,0);
+
+/* ---------- pet companion ---------- */
+const PET_STAGES=[[0,'Mysterious Egg'],[1,'Hatchling'],[4,'Garden Noodle'],[8,'Vine Viper'],[12,'River Boa'],[17,'Ridge Python'],[24,'Golden Python']];
+function petStage(n){let s=PET_STAGES[0];for(const st of PET_STAGES)if(n>=st[0])s=st;return s;}
+function petNextStage(n){for(const st of PET_STAGES)if(st[0]>n)return st;return null;}
+function petSVG(n){
+  const W=210,H=64,cy=36;
+  if(n===0){
+    return `<svg viewBox="0 0 ${W} ${H}" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="A speckled snake egg in a nest">
+      <path d="M ${W/2-26} ${cy+14} Q ${W/2} ${cy+26} ${W/2+26} ${cy+14}" stroke="#1e3a30" stroke-width="4" fill="none" stroke-linecap="round"/>
+      <ellipse cx="${W/2}" cy="${cy-4}" rx="15" ry="19" fill="#d8cfae" stroke="#b98a2e" stroke-width="1.5"/>
+      <circle cx="${W/2-5}" cy="${cy-11}" r="2" fill="#b98a2e"/>
+      <circle cx="${W/2+6}" cy="${cy-2}" r="2.4" fill="#b98a2e"/>
+      <circle cx="${W/2-3}" cy="${cy+5}" r="1.5" fill="#b98a2e"/>
+    </svg>`;
+  }
+  const stageIdx=PET_STAGES.indexOf(petStage(n));
+  const golden=n>=PET_STAGES[PET_STAGES.length-1][0];
+  const segs=Math.min(n,24);
+  const len=Math.min(46+segs*6.5,W-26);
+  const amp=6+stageIdx*1.4;
+  const waves=1.2+segs*0.11;
+  const x0=8;
+  const pts=[];
+  let hx=x0,hy=cy;
+  for(let i=0;i<=60;i++){
+    const t=i/60;
+    hx=x0+len*t;
+    hy=cy+Math.sin(t*Math.PI*2*waves)*amp*(0.35+0.65*t);
+    pts.push(hx.toFixed(1)+','+hy.toFixed(1));
+  }
+  const col=golden?'#f2b33d':'#4fbf8b';
+  const sw=(3+stageIdx*0.8).toFixed(1);
+  const hr=(4.5+stageIdx*0.8).toFixed(1);
+  return `<svg viewBox="0 0 ${W} ${H}" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Your snake companion, ${petStage(n)[1]}, ${segs} segments long">
+    <polyline points="${pts.join(' ')}" fill="none" stroke="${col}" stroke-width="${sw}" stroke-linecap="round" stroke-linejoin="round" opacity="0.95"/>
+    <circle cx="${hx.toFixed(1)}" cy="${hy.toFixed(1)}" r="${hr}" fill="${col}"/>
+    <circle cx="${(hx+1.5).toFixed(1)}" cy="${(hy-1.8).toFixed(1)}" r="1.3" fill="#0c1a16"/>
+    <path d="M ${(hx+Number(hr)).toFixed(1)} ${hy.toFixed(1)} l 5 0 m 0 0 l 3 -2 m -3 2 l 3 2" stroke="#e0645c" stroke-width="1.2" fill="none"/>
+    ${golden?`<circle cx="${(hx-10).toFixed(1)}" cy="${(hy-12).toFixed(1)}" r="1.5" fill="#ffe9b3"/><circle cx="${(hx-22).toFixed(1)}" cy="${(hy+8).toFixed(1)}" r="1.2" fill="#ffe9b3"/>`:''}
+  </svg>`;
+}
+function petPanelHTML(){
+  const n=state.solved.length;
+  const st=petStage(n),nx=petNextStage(n);
+  return `<div class="pet">
+    <div class="pet-top">
+      <span class="pet-name" id="petname">${escHtml(state.petName)}</span>
+      <button class="pet-rename" id="petrename" title="Rename your companion">✎ name</button>
+      <span class="pet-stage">${st[1]}</span>
+    </div>
+    <div class="pet-art">${petSVG(n)}</div>
+    <div class="pet-meta">${n===0
+      ?'Solve your first challenge to hatch the egg'
+      :`Pet Lv ${n} · +1 segment per solve${nx?` · next form at Lv ${nx[0]}`:' · final form'}`}</div>
+  </div>`;
+}
 
 /* =====================================================================
    PART 3 — Game engine & UI
    ===================================================================== */
 const SAVE_KEY='python-expedition-v1';
-let state={solved:[],xp:0,current:null,drafts:{}};
+let state={solved:[],xp:0,current:null,drafts:{},petName:'Pip'};
 try{
   const raw=localStorage.getItem(SAVE_KEY);
   if(raw){const s=JSON.parse(raw);
-    if(s&&Array.isArray(s.solved))state={solved:s.solved,xp:s.xp|0,current:s.current||null,drafts:s.drafts||{}};}
+    if(s&&Array.isArray(s.solved))state={solved:s.solved,xp:s.xp|0,current:s.current||null,drafts:s.drafts||{},petName:(typeof s.petName==='string'&&s.petName.trim())?s.petName.trim().slice(0,16):'Pip'};}
 }catch(e){}
 function save(){try{localStorage.setItem(SAVE_KEY,JSON.stringify(state));}catch(e){}}
 
@@ -1311,7 +1524,8 @@ function renderHUD(){
 }
 
 function renderMap(){
-  mapEl.innerHTML='';
+  mapEl.innerHTML=petPanelHTML();
+  attachPetHandlers();
   let lastCh=-1;
   LEVELS.forEach((lv,i)=>{
     if(lv.ch!==lastCh){
@@ -1335,12 +1549,45 @@ function renderMap(){
   const foot=document.createElement('div');foot.className='mapfoot';
   const reset=document.createElement('button');
   reset.textContent='Reset all progress';
+  let armed=false,disarm=null;
   reset.addEventListener('click',()=>{
-    if(confirm('Erase all expedition progress and start over?')){
-      state={solved:[],xp:0,current:null,drafts:{}};save();render();
+    if(!armed){
+      armed=true;
+      reset.textContent='Erase everything? Click again';
+      reset.style.color='var(--ember)';
+      disarm=setTimeout(()=>{armed=false;reset.textContent='Reset all progress';reset.style.color='';},4000);
+      return;
     }
+    clearTimeout(disarm);
+    state={solved:[],xp:0,current:null,drafts:{},petName:state.petName};save();render();
   });
   foot.appendChild(reset);mapEl.appendChild(foot);
+}
+
+function attachPetHandlers(){
+  const btn=$('#petrename');
+  if(!btn)return;
+  btn.addEventListener('click',()=>{
+    const span=$('#petname');
+    if(span.querySelector('input'))return;
+    const inp=document.createElement('input');
+    inp.value=state.petName;inp.maxLength=16;
+    inp.setAttribute('aria-label','Companion name');
+    inp.style.cssText='width:7.5rem;font-family:var(--mono);font-size:.85rem;font-weight:700;color:var(--gold);background:var(--ink);border:1px solid var(--gold-dim);border-radius:3px;padding:0 .25rem';
+    span.textContent='';span.appendChild(inp);inp.focus();inp.select();
+    let doneCalled=false;
+    const done=()=>{
+      if(doneCalled)return;doneCalled=true;
+      const v=inp.value.trim().slice(0,16);
+      if(v)state.petName=v;
+      save();renderMap();
+    };
+    inp.addEventListener('blur',done);
+    inp.addEventListener('keydown',e=>{
+      if(e.key==='Enter')done();
+      else if(e.key==='Escape'){doneCalled=true;renderMap();}
+    });
+  });
 }
 
 function escHtml(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
@@ -1349,15 +1596,16 @@ function renderHero(){
   const done=state.solved.length;
   mainEl.innerHTML=`
   <div class="hero">
-    <p class="eyebrow">An interactive field course · 5 chapters · 15 challenges</p>
+    <p class="eyebrow">An interactive field course · 8 chapters · 24 challenges</p>
     <h1>Learn Python by<br>charting the<br>Serpent Isles<span class="cursor"></span></h1>
     <p>Every challenge is real code, run by a real interpreter, right here on this page.
     You'll write it, run it, break it, and fix it — earning XP from Hatchling to Pythonista.</p>
     <div class="creds">
       <span class="g">&gt;&gt;&gt;</span> print, variables, f-strings<br>
       <span class="g">&gt;&gt;&gt;</span> if / elif / else, comparisons<br>
-      <span class="g">&gt;&gt;&gt;</span> for &amp; while loops, range()<br>
-      <span class="g">&gt;&gt;&gt;</span> lists, functions, return<br>
+      <span class="g">&gt;&gt;&gt;</span> for &amp; while loops, range(), modulo<br>
+      <span class="g">&gt;&gt;&gt;</span> strings, lists, functions, FizzBuzz<br>
+      <span class="y">### raise a snake companion from egg to Golden Python</span><br>
       <span class="y">### no installs · progress saves in your browser</span>
     </div>
     <button class="run" id="begin">${done>0?'CONTINUE EXPEDITION ▸':'BEGIN EXPEDITION ▸'}</button>
@@ -1375,9 +1623,10 @@ function renderFinish(){
     <h1 class="title">The Serpent Isles are charted.</h1>
     <p class="bigrank">RANK: PYTHONISTA — ${state.xp} XP</p>
     <div class="brief">
-    <p>Fifteen challenges, five chapters, and every line of it real Python. You've covered the
-    foundations most beginner courses spend weeks on: output, variables, strings, arithmetic,
-    branching, loops, lists, and functions.</p>
+    <p>Twenty-four challenges, eight chapters, and every line of it real Python. You've covered
+    the foundations most beginner courses spend weeks on: output, variables, strings and their
+    methods, arithmetic and modulo, branching, for and while loops, lists, and functions —
+    and your companion reached its final golden form.</p>
     <p>Where to next? The <strong>Playground</strong> on the map is yours — try combining
     everything: a function that loops over a list, an f-string report of the results.
     When you're ready for the mainland, install real Python from
@@ -1504,16 +1753,20 @@ function runLevel(lv,ta){
   const want=normalize(lv.expected);
   if(!res.error && got===want){
     const first=!isSolved(lv.id);
+    let evolved=null;
     if(first){
+      const before=petStage(state.solved.length)[1];
       state.solved.push(lv.id);
       state.xp+=lv.xp;
+      const after=petStage(state.solved.length)[1];
+      if(after!==before)evolved=after;
       save();renderHUD();renderMap();
     }
     const idx=LEVELS.indexOf(lv);
     const next=LEVELS[idx+1];
     banner.className='banner win show';
     banner.innerHTML=`<span class="headline">✓ OUTPUT MATCHES${first?` — +${lv.xp} XP`:''}</span>
-      <span>${first&&rankJustChanged()?`New rank: <b style="color:var(--gold)">${rankFor(state.xp)}</b>`:''}</span>
+      <span>${evolved?`${escHtml(state.petName)} ${evolved==='Hatchling'?'hatched into a':'evolved into a'} <b style="color:var(--leaf)">${evolved}</b>! `:''}${first&&rankJustChanged()?`New rank: <b style="color:var(--gold)">${rankFor(state.xp)}</b>`:''}</span>
       ${next?`<button class="next" id="nextbtn">NEXT: ${escHtml(next.title.toUpperCase())} ▸</button>`
             :`<button class="next" id="nextbtn">FINISH EXPEDITION ▸</button>`}`;
     $('#nextbtn').addEventListener('click',()=>{
@@ -1565,6 +1818,8 @@ function render(){
   renderHUD();renderMap();
   prevRank=rankFor(state.xp);
   if(state.current==='playground')return renderPlayground();
+  // players who finished before new chapters existed: send them back to the map
+  if(state.current==='finish'&&state.solved.length<LEVELS.length)state.current=null;
   if(state.current==='finish'||(state.solved.length===LEVELS.length&&state.current===null))return renderFinish();
   const lv=LEVELS.find(l=>l.id===state.current);
   if(lv&&isUnlocked(LEVELS.indexOf(lv)))return renderLevel(lv);
