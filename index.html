@@ -56,6 +56,15 @@
   .xpbar{width:150px;height:8px;background:var(--line);border-radius:99px;overflow:hidden}
   .xpbar>div{height:100%;background:linear-gradient(90deg,var(--gold-dim),var(--gold));width:0%;transition:width .5s ease}
   .xpnum{font-family:var(--mono);font-size:.78rem;color:var(--text-dim);font-variant-numeric:tabular-nums;white-space:nowrap}
+  button.sound{
+    font-family:var(--mono);font-size:.64rem;letter-spacing:.14em;
+    background:none;color:var(--text-dim);
+    border:1px solid var(--line);border-radius:3px;
+    padding:.28rem .5rem;cursor:pointer;white-space:nowrap;
+  }
+  button.sound:hover{color:var(--text);border-color:var(--text-dim)}
+  button.sound:focus-visible{outline:2px solid var(--gold);outline-offset:2px}
+  button.sound[aria-pressed="true"]{color:#5c6b5f}
 
   /* ---------- layout ---------- */
   .shell{display:grid;grid-template-columns:280px 1fr;min-height:calc(100vh - 58px)}
@@ -259,8 +268,9 @@
     <span class="rank" id="rank">HATCHLING</span>
     <span class="xpwrap">
       <span class="xpbar"><div id="xpfill"></div></span>
-      <span class="xpnum" id="xpnum">0 / 225 XP</span>
+      <span class="xpnum" id="xpnum">0 / 450 XP</span>
     </span>
+    <button class="sound" id="soundbtn" aria-pressed="false">SOUND ON</button>
   </div>
 </header>
 
@@ -1500,12 +1510,41 @@ function petPanelHTML(){
 /* =====================================================================
    PART 3 — Game engine & UI
    ===================================================================== */
+
+/* ---------- sound: synthesized, no external audio files ---------- */
+let audioCtx=null;
+function chime(evolved){
+  if(state.muted)return;
+  const AC=window.AudioContext||window.webkitAudioContext;
+  if(!AC)return;
+  try{
+    if(!audioCtx)audioCtx=new AC();
+    if(audioCtx.state==='suspended')audioCtx.resume();
+    const t0=audioCtx.currentTime+0.01;
+    // C5 E5 G5 — a rising major triad; an extra octave C6 when the pet evolves
+    const notes=evolved?[523.25,659.25,783.99,1046.5]:[523.25,659.25,783.99];
+    notes.forEach((f,i)=>{
+      const t=t0+i*0.085;
+      const osc=audioCtx.createOscillator();
+      const gain=audioCtx.createGain();
+      osc.type='triangle';
+      osc.frequency.setValueAtTime(f,t);
+      gain.gain.setValueAtTime(0.0001,t);
+      gain.gain.exponentialRampToValueAtTime(0.16,t+0.012);
+      gain.gain.exponentialRampToValueAtTime(0.0001,t+0.4);
+      osc.connect(gain).connect(audioCtx.destination);
+      osc.start(t);
+      osc.stop(t+0.42);
+    });
+  }catch(e){/* audio is a nicety — never break the game over it */}
+}
+
 const SAVE_KEY='python-expedition-v1';
-let state={solved:[],xp:0,current:null,drafts:{},petName:'Pip'};
+let state={solved:[],xp:0,current:null,drafts:{},petName:'Pip',muted:false};
 try{
   const raw=localStorage.getItem(SAVE_KEY);
   if(raw){const s=JSON.parse(raw);
-    if(s&&Array.isArray(s.solved))state={solved:s.solved,xp:s.xp|0,current:s.current||null,drafts:s.drafts||{},petName:(typeof s.petName==='string'&&s.petName.trim())?s.petName.trim().slice(0,16):'Pip'};}
+    if(s&&Array.isArray(s.solved))state={solved:s.solved,xp:s.xp|0,current:s.current||null,drafts:s.drafts||{},petName:(typeof s.petName==='string'&&s.petName.trim())?s.petName.trim().slice(0,16):'Pip',muted:!!s.muted};}
 }catch(e){}
 function save(){try{localStorage.setItem(SAVE_KEY,JSON.stringify(state));}catch(e){}}
 
@@ -1521,7 +1560,15 @@ function renderHUD(){
   $('#rank').textContent=rankFor(state.xp).toUpperCase();
   $('#xpnum').textContent=`${state.xp} / ${TOTAL_XP} XP`;
   $('#xpfill').style.width=(100*state.xp/TOTAL_XP)+'%';
+  const sb=$('#soundbtn');
+  sb.textContent=state.muted?'SOUND OFF':'SOUND ON';
+  sb.setAttribute('aria-pressed',state.muted?'true':'false');
+  sb.title=state.muted?'Turn the success chime on':'Turn the success chime off';
 }
+$('#soundbtn').addEventListener('click',()=>{
+  state.muted=!state.muted;save();renderHUD();
+  if(!state.muted)chime(false);   // preview the sound you just switched on
+});
 
 function renderMap(){
   mapEl.innerHTML=petPanelHTML();
@@ -1762,6 +1809,7 @@ function runLevel(lv,ta){
       if(after!==before)evolved=after;
       save();renderHUD();renderMap();
     }
+    chime(!!evolved);
     const idx=LEVELS.indexOf(lv);
     const next=LEVELS[idx+1];
     banner.className='banner win show';
