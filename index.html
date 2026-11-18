@@ -283,25 +283,46 @@
 'use strict';
 /* =====================================================================
    PART 1 — A miniature Python interpreter (real lexer/parser/evaluator)
-   Supports: print, variables, numbers (int/float), strings & f-strings,
-   arithmetic (+ - * / // % **), comparisons, and/or/not, if/elif/else,
-   while, for..in, range(), lists, .append()/.pop(), common str methods,
-   def/return, break/continue/pass, len/str/int/float/abs/min/max/sum/round.
+   Supports: print (sep/end), variables, int/float, strings & f-strings
+   (with format specs like {x:.2f} and {name:<10}), arithmetic, chained
+   comparisons, and/or/not, in/not in/is, if/elif/else, conditional
+   expressions, while, for (with tuple unpacking), break/continue/pass,
+   lists, tuples, dicts, slicing, list/dict comprehensions, def (default and
+   keyword arguments), lambda, recursion, try/except/else/finally, raise,
+   classes with __init__/__str__/methods/inheritance, del, and the common
+   built-ins and str/list/dict methods. Brackets may span several lines.
    ===================================================================== */
 
 class PyError extends Error{
-  constructor(kind,msg,line){super(msg);this.kind=kind;this.pyline=line;}
+  constructor(kind,msg,line,fatal){super(msg);this.kind=kind;this.pyline=line;this.fatal=!!fatal;}
 }
 class PyNum{constructor(v,isFloat){this.v=v;this.isFloat=!!isFloat;}}
+class PyTuple{constructor(items){this.items=items;}}
+class PyView{constructor(kind,items){this.kind=kind;this.items=items;}}
+class PyDict{
+  constructor(){this.m=new Map();}
+  get size(){return this.m.size;}
+  has(k){return this.m.has(hashKey(k));}
+  get(k){const e=this.m.get(hashKey(k));return e?e[1]:undefined;}
+  set(k,v){const h=hashKey(k);const e=this.m.get(h);if(e)e[1]=v;else this.m.set(h,[k,v]);}
+  del(k){return this.m.delete(hashKey(k));}
+  keys(){return [...this.m.values()].map(e=>e[0]);}
+  values(){return [...this.m.values()].map(e=>e[1]);}
+  entries(){return [...this.m.values()];}
+}
 const PyNone = Symbol('None');
 class BreakSig{} class ContinueSig{} class ReturnSig{constructor(v){this.v=v;}}
+let CUR=null; // the interpreter currently running (lets __str__ hooks run from pyStr)
 
 const KEYWORDS = new Set(['if','elif','else','while','for','in','def','return',
-  'break','continue','pass','and','or','not','True','False','None']);
-const TWO_OPS = ['**','//','==','!=','<=','>=','+=','-=','*=','/='];
-const ONE_OPS = '+-*/%()[],:.<>=';
+  'break','continue','pass','and','or','not','True','False','None',
+  'try','except','finally','raise','class','as','is','del','lambda']);
+const THREE_OPS = ['//=','**='];
+const TWO_OPS = ['**','//','==','!=','<=','>=','+=','-=','*=','/=','%='];
+const ONE_OPS = '+-*/%()[]{},:.<>=';
+const AUG_OPS = ['+=','-=','*=','/=','//=','%=','**='];
 
-function decodeEscapes(s,line){
+function decodeEscapes(s){
   let out='';
   for(let i=0;i<s.length;i++){
     if(s[i]==='\\'){
@@ -320,25 +341,30 @@ function decodeEscapes(s,line){
 function lex(src){
   const lines = src.replace(/\r\n?/g,'\n').split('\n');
   const toks=[]; const indents=[0];
+  let depth=0, joined=false, openLine=0;
   for(let li=0; li<lines.length; li++){
     const raw = lines[li];
     const ln = li+1;
     const ws = raw.match(/^[ \t]*/)[0];
     const rest = raw.slice(ws.length);
-    if(rest==='' || rest.startsWith('#')) continue;
-    const indent = ws.replace(/\t/g,'    ').length;
-    if(indent > indents[indents.length-1]){
-      indents.push(indent); toks.push({t:'INDENT',line:ln});
-    } else {
-      while(indent < indents[indents.length-1]){ indents.pop(); toks.push({t:'DEDENT',line:ln}); }
-      if(indent !== indents[indents.length-1])
-        throw new PyError('IndentationError','unindent does not match any outer indentation level',ln);
+    if(depth===0 && !joined){
+      if(rest==='' || rest.startsWith('#')) continue;
+      const indent = ws.replace(/\t/g,'    ').length;
+      if(indent > indents[indents.length-1]){
+        indents.push(indent); toks.push({t:'INDENT',line:ln});
+      } else {
+        while(indent < indents[indents.length-1]){ indents.pop(); toks.push({t:'DEDENT',line:ln}); }
+        if(indent !== indents[indents.length-1])
+          throw new PyError('IndentationError','unindent does not match any outer indentation level',ln);
+      }
     }
+    joined=false;
     let i=0;
     while(i<rest.length){
       const c=rest[i];
       if(c===' '||c==='\t'){i++;continue;}
       if(c==='#') break;
+      if(c==='\\' && rest.slice(i+1).trim()===''){joined=true;break;}
       // f-string
       if((c==='f'||c==='F') && (rest[i+1]==='"'||rest[i+1]==="'")){
         const q=rest[i+1]; let j=i+2; let body='';
@@ -357,15 +383,17 @@ function lex(src){
           else {body+=rest[j]; j++;}
         }
         if(j>=rest.length) throw new PyError('SyntaxError','unterminated string literal',ln);
-        toks.push({t:'STR',v:decodeEscapes(body,ln),line:ln}); i=j+1; continue;
+        toks.push({t:'STR',v:decodeEscapes(body),line:ln}); i=j+1; continue;
       }
       // number
       if(/[0-9]/.test(c) || (c==='.' && /[0-9]/.test(rest[i+1]||''))){
         let j=i; let sawDot=false;
-        while(j<rest.length && (/[0-9]/.test(rest[j]) || (rest[j]==='.' && !sawDot))){
+        while(j<rest.length && (/[0-9_]/.test(rest[j]) || (rest[j]==='.' && !sawDot))){
           if(rest[j]==='.') sawDot=true; j++;
         }
-        toks.push({t:'NUM',v:parseFloat(rest.slice(i,j)),f:sawDot,line:ln}); i=j; continue;
+        const ex=rest.slice(j).match(/^[eE][+-]?[0-9]+/);
+        if(ex){j+=ex[0].length;sawDot=true;}
+        toks.push({t:'NUM',v:parseFloat(rest.slice(i,j).replace(/_/g,'')),f:sawDot,line:ln}); i=j; continue;
       }
       // name / keyword
       if(/[A-Za-z_]/.test(c)){
@@ -373,33 +401,54 @@ function lex(src){
         const w=rest.slice(i,j);
         toks.push({t:KEYWORDS.has(w)?'KW':'NAME',v:w,line:ln}); i=j; continue;
       }
+      const three=rest.slice(i,i+3);
+      if(THREE_OPS.includes(three)){toks.push({t:'OP',v:three,line:ln}); i+=3; continue;}
       const two=rest.slice(i,i+2);
       if(TWO_OPS.includes(two)){toks.push({t:'OP',v:two,line:ln}); i+=2; continue;}
-      if(ONE_OPS.includes(c)){toks.push({t:'OP',v:c,line:ln}); i++; continue;}
+      if(ONE_OPS.includes(c)){
+        if('([{'.includes(c)){if(depth===0)openLine=ln;depth++;}
+        else if(')]}'.includes(c)){
+          if(depth===0)throw new PyError('SyntaxError',`unmatched '${c}'`,ln);
+          depth--;
+        }
+        toks.push({t:'OP',v:c,line:ln}); i++; continue;
+      }
+      if(c==='!')throw new PyError('SyntaxError',"invalid character '!' — Python writes \"not equal\" as != and \"not\" as the word not",ln);
       throw new PyError('SyntaxError',`invalid character '${c}'`,ln);
     }
-    toks.push({t:'NEWLINE',line:ln});
+    if(depth===0 && !joined) toks.push({t:'NEWLINE',line:ln});
   }
+  if(depth>0) throw new PyError('SyntaxError','a bracket was opened here but never closed',openLine);
+  if(toks.length && toks[toks.length-1].t!=='NEWLINE' && toks[toks.length-1].t!=='DEDENT')
+    toks.push({t:'NEWLINE',line:lines.length});
   while(indents.length>1){indents.pop();toks.push({t:'DEDENT',line:lines.length});}
   toks.push({t:'EOF',line:lines.length});
   return toks;
 }
 
+function validTarget(t){
+  if(t.k==='name'||t.k==='index'||t.k==='attr')return true;
+  if(t.k==='tuple'||t.k==='list')return t.items.every(validTarget);
+  return false;
+}
+
 class Parser{
   constructor(toks){this.toks=toks;this.pos=0;}
-  peek(){return this.toks[this.pos];}
+  peek(o){return this.toks[this.pos+(o||0)]||{t:'EOF',line:0};}
   next(){return this.toks[this.pos++];}
   at(t,v){const k=this.peek();return k.t===t && (v===undefined || k.v===v);}
   eat(t,v){if(this.at(t,v))return this.next();return null;}
   expect(t,v,what){
     const k=this.peek();
     if(k.t===t && (v===undefined||k.v===v)) return this.next();
-    throw new PyError('SyntaxError',`expected ${what||v||t}`,k.line);
+    const got=k.t==='EOF'?'the end of the code':k.t==='NEWLINE'?'the end of the line':k.t==='INDENT'?'an unexpected indent':`'${k.v}'`;
+    throw new PyError(k.t==='INDENT'?'IndentationError':'SyntaxError',`expected ${what||`'${v}'`||t}, but found ${got}`,k.line);
   }
   parseProgram(){
     const body=[];
     while(!this.at('EOF')){
       if(this.eat('NEWLINE')) continue;
+      if(this.at('INDENT'))throw new PyError('IndentationError','unexpected indent',this.peek().line);
       body.push(this.parseStmt());
     }
     return {k:'block',body};
@@ -407,7 +456,9 @@ class Parser{
   parseBlock(){
     // after ':' — either NEWLINE INDENT ... DEDENT, or one inline simple stmt
     if(this.eat('NEWLINE')){
-      this.expect('INDENT',undefined,'an indented block');
+      if(!this.at('INDENT'))
+        throw new PyError('IndentationError','expected an indented block',this.peek().line);
+      this.next();
       const body=[];
       while(!this.at('DEDENT') && !this.at('EOF')){
         if(this.eat('NEWLINE')) continue;
@@ -419,6 +470,19 @@ class Parser{
     const s=this.parseSimpleStmt();
     this.eat('NEWLINE');
     return {k:'block',body:[s]};
+  }
+  parseParams(close){
+    const params=[],defaults=[];
+    while(!this.at('OP',close)){
+      params.push(this.expect('NAME',undefined,'a parameter name').v);
+      if(this.eat('OP','='))defaults.push(this.parseExpr());
+      else {
+        if(defaults.some(d=>d))throw new PyError('SyntaxError','a parameter without a default cannot follow one with a default',this.peek().line);
+        defaults.push(null);
+      }
+      if(!this.eat('OP',','))break;
+    }
+    return {params,defaults};
   }
   parseStmt(){
     const k=this.peek();
@@ -433,29 +497,65 @@ class Parser{
         }
         case 'for':{
           const line=this.next().line;
-          const name=this.expect('NAME',undefined,'a loop variable name').v;
+          const target=this.parseTarget();
           this.expect('KW','in');
-          const iter=this.parseExpr();
+          const iter=this.parseTestList();
           this.expect('OP',':');
-          return {k:'for',name,iter,body:this.parseBlock(),line};
+          return {k:'for',target,iter,body:this.parseBlock(),line};
         }
         case 'def':{
           const line=this.next().line;
           const name=this.expect('NAME',undefined,'a function name').v;
           this.expect('OP','(');
-          const params=[];
-          if(!this.at('OP',')')){
-            do{ params.push(this.expect('NAME',undefined,'a parameter name').v); }
-            while(this.eat('OP',','));
-          }
+          const {params,defaults}=this.parseParams(')');
           this.expect('OP',')');
           this.expect('OP',':');
-          return {k:'def',name,params,body:this.parseBlock(),line};
+          return {k:'def',name,params,defaults,body:this.parseBlock(),line};
+        }
+        case 'class':{
+          const line=this.next().line;
+          const name=this.expect('NAME',undefined,'a class name').v;
+          let base=null;
+          if(this.eat('OP','(')){
+            if(!this.at('OP',')'))base=this.parseExpr();
+            this.expect('OP',')');
+          }
+          this.expect('OP',':');
+          return {k:'class',name,base,body:this.parseBlock(),line};
+        }
+        case 'try':{
+          const line=this.next().line;
+          this.expect('OP',':');
+          const body=this.parseBlock();
+          const handlers=[];
+          while(this.at('KW','except')){
+            const hl=this.next().line;
+            let types=null,as=null;
+            if(!this.at('OP',':')){
+              types=[];
+              if(this.eat('OP','(')){
+                do{types.push(this.expect('NAME',undefined,'an exception name').v);}while(this.eat('OP',',')&&!this.at('OP',')'));
+                this.expect('OP',')');
+              } else types.push(this.expect('NAME',undefined,'an exception name').v);
+              if(this.eat('KW','as'))as=this.expect('NAME',undefined,'a variable name').v;
+            }
+            this.expect('OP',':');
+            handlers.push({types,as,body:this.parseBlock(),line:hl});
+          }
+          let orelse=null,final=null;
+          if(handlers.length&&this.eat('KW','else')){this.expect('OP',':');orelse=this.parseBlock();}
+          if(this.eat('KW','finally')){this.expect('OP',':');final=this.parseBlock();}
+          if(!handlers.length&&!final)
+            throw new PyError('SyntaxError',"expected 'except' or 'finally' block",this.peek().line);
+          return {k:'try',body,handlers,orelse,final,line};
         }
       }
     }
     const s=this.parseSimpleStmt();
-    this.eat('NEWLINE');
+    if(!this.eat('NEWLINE')&&!this.at('EOF')&&!this.at('DEDENT')){
+      const t=this.peek();
+      throw new PyError('SyntaxError',`unexpected ${t.t==='INDENT'?'indent':`'${t.v}'`} — did you forget an operator or a comma?`,t.line);
+    }
     return s;
   }
   parseIf(){
@@ -473,25 +573,92 @@ class Parser{
     if(k.t==='KW'){
       if(k.v==='return'){ this.next();
         let val=null;
-        if(!this.at('NEWLINE') && !this.at('EOF')) val=this.parseExpr();
+        if(!this.at('NEWLINE') && !this.at('EOF')) val=this.parseTestList();
         return {k:'return',val,line:k.line};
       }
       if(k.v==='break'){this.next();return {k:'break',line:k.line};}
       if(k.v==='continue'){this.next();return {k:'continue',line:k.line};}
       if(k.v==='pass'){this.next();return {k:'pass',line:k.line};}
+      if(k.v==='raise'){this.next();
+        const exc=(this.at('NEWLINE')||this.at('EOF'))?null:this.parseExpr();
+        return {k:'raise',exc,line:k.line};
+      }
+      if(k.v==='del'){this.next();
+        const targets=[this.parseExpr()];
+        while(this.eat('OP',','))targets.push(this.parseExpr());
+        for(const t of targets)if(!['name','index'].includes(t.k))
+          throw new PyError('SyntaxError','del needs a variable name or an item like d[key]',k.line);
+        return {k:'del',targets,line:k.line};
+      }
     }
-    const expr=this.parseExpr();
+    const expr=this.parseTestList();
     const op=this.peek();
-    if(op.t==='OP' && ['=','+=','-=','*=','/='].includes(op.v)){
+    if(op.t==='OP' && op.v==='='){
+      const targets=[expr]; let val;
+      for(;;){
+        this.expect('OP','=');
+        val=this.parseTestList();
+        if(this.at('OP','=')){targets.push(val);continue;}
+        break;
+      }
+      for(const t of targets)if(!validTarget(t))
+        throw new PyError('SyntaxError',t.k==='call'?"cannot assign to a function call — did you mean == ?":'cannot assign to this expression',op.line);
+      return {k:'assign',targets,op:'=',val,line:op.line};
+    }
+    if(op.t==='OP' && AUG_OPS.includes(op.v)){
       this.next();
-      if(expr.k!=='name' && expr.k!=='index')
-        throw new PyError('SyntaxError','cannot assign to this expression',op.line);
-      const val=this.parseExpr();
-      return {k:'assign',target:expr,op:op.v,val,line:op.line};
+      if(!['name','index','attr'].includes(expr.k))
+        throw new PyError('SyntaxError',`'${op.v}' needs a single variable or item on its left`,op.line);
+      const val=this.parseTestList();
+      return {k:'assign',targets:[expr],op:op.v,val,line:op.line};
     }
     return {k:'exprstmt',expr,line:expr.line};
   }
-  parseExpr(){return this.parseOr();}
+  atListEnd(){
+    const k=this.peek();
+    return k.t==='NEWLINE'||k.t==='EOF'||(k.t==='OP'&&[')',']','}','=',':'].concat(AUG_OPS).includes(k.v));
+  }
+  parseTestList(){
+    const first=this.parseExpr();
+    if(!this.at('OP',','))return first;
+    const items=[first];
+    while(this.eat('OP',',')){
+      if(this.atListEnd())break;
+      items.push(this.parseExpr());
+    }
+    return {k:'tuple',items,line:first.line};
+  }
+  parseTarget(){
+    const one=()=>{
+      if(this.eat('OP','(')){const t=this.parseTarget();this.expect('OP',')');return t;}
+      const n=this.expect('NAME',undefined,'a variable name');
+      return {k:'name',v:n.v,line:n.line};
+    };
+    const first=one();
+    if(!this.at('OP',','))return first;
+    const items=[first];
+    while(this.eat('OP',',')){
+      if(this.at('KW','in')||this.at('OP',')'))break;
+      items.push(one());
+    }
+    return {k:'tuple',items,line:first.line};
+  }
+  parseExpr(){
+    if(this.at('KW','lambda')){
+      const line=this.next().line;
+      const {params,defaults}=this.parseParams(':');
+      this.expect('OP',':');
+      return {k:'lambda',params,defaults,body:this.parseExpr(),line};
+    }
+    const e=this.parseOr();
+    if(this.at('KW','if')){
+      const line=this.next().line;
+      const test=this.parseOr();
+      this.expect('KW','else',"'else' (a one-line if needs both parts: a if condition else b)");
+      return {k:'ifexp',test,body:e,orelse:this.parseExpr(),line};
+    }
+    return e;
+  }
   parseOr(){
     let l=this.parseAnd();
     while(this.at('KW','or')){const line=this.next().line;l={k:'or',l,r:this.parseAnd(),line};}
@@ -507,17 +674,19 @@ class Parser{
     return this.parseCmp();
   }
   parseCmp(){
-    let l=this.parseAdd();
-    const k=this.peek();
-    if(k.t==='OP' && ['==','!=','<','>','<=','>='].includes(k.v)){
-      this.next();
-      return {k:'cmp',op:k.v,l,r:this.parseAdd(),line:k.line};
+    const first=this.parseAdd();
+    const ops=[],rest=[];let line=first.line;
+    for(;;){
+      const k=this.peek();let op=null;
+      if(k.t==='OP'&&['==','!=','<','>','<=','>='].includes(k.v)){this.next();op=k.v;}
+      else if(k.t==='KW'&&k.v==='in'){this.next();op='in';}
+      else if(k.t==='KW'&&k.v==='not'&&this.peek(1).t==='KW'&&this.peek(1).v==='in'){this.next();this.next();op='not in';}
+      else if(k.t==='KW'&&k.v==='is'){this.next();op=this.eat('KW','not')?'is not':'is';}
+      else break;
+      line=k.line;ops.push(op);rest.push(this.parseAdd());
     }
-    if(k.t==='KW' && k.v==='in'){
-      this.next();
-      return {k:'in',l,r:this.parseAdd(),line:k.line};
-    }
-    return l;
+    if(!ops.length)return first;
+    return {k:'cmp',ops,operands:[first,...rest],line};
   }
   parseAdd(){
     let l=this.parseMul();
@@ -546,22 +715,50 @@ class Parser{
     }
     return base;
   }
+  parseComp(kind,elt,val,line){
+    const gens=[];
+    while(this.eat('KW','for')){
+      const target=this.parseTarget();
+      this.expect('KW','in');
+      const iter=this.parseOr();
+      const conds=[];
+      while(this.eat('KW','if'))conds.push(this.parseOr());
+      gens.push({target,iter,conds});
+    }
+    return {k:'comp',kind,elt,val,gens,line};
+  }
   parsePostfix(){
     let e=this.parseAtom();
     for(;;){
       if(this.at('OP','(')){
         const line=this.next().line;
-        const args=[];
-        if(!this.at('OP',')')){
-          do{ args.push(this.parseExpr()); } while(this.eat('OP',','));
+        const args=[],kwargs=[];
+        while(!this.at('OP',')')){
+          if(this.peek().t==='NAME'&&this.peek(1).t==='OP'&&this.peek(1).v==='='){
+            const name=this.next().v;this.next();
+            kwargs.push({name,val:this.parseExpr()});
+          } else {
+            if(kwargs.length)throw new PyError('SyntaxError','a positional argument cannot follow a keyword argument',this.peek().line);
+            let a=this.parseExpr();
+            if(this.at('KW','for'))a=this.parseComp('list',a,null,line); // generator → list
+            args.push(a);
+          }
+          if(!this.eat('OP',','))break;
         }
-        this.expect('OP',')');
-        e={k:'call',fn:e,args,line};
+        this.expect('OP',')',"')' to close the function call");
+        e={k:'call',fn:e,args,kwargs,line};
       } else if(this.at('OP','[')){
         const line=this.next().line;
-        const idx=this.parseExpr();
+        const parts=[null,null,null];let isSlice=false;
+        if(!this.at('OP',':'))parts[0]=this.parseExpr();
+        if(this.eat('OP',':')){
+          isSlice=true;
+          if(!this.at('OP',':')&&!this.at('OP',']'))parts[1]=this.parseExpr();
+          if(this.eat('OP',':')&&!this.at('OP',']'))parts[2]=this.parseExpr();
+        }
         this.expect('OP',']');
-        e={k:'index',obj:e,idx,line};
+        e=isSlice?{k:'slice',obj:e,lo:parts[0],hi:parts[1],step:parts[2],line}
+                 :{k:'index',obj:e,idx:parts[0],line};
       } else if(this.at('OP','.')){
         const line=this.next().line;
         const name=this.expect('NAME',undefined,'an attribute name').v;
@@ -573,8 +770,17 @@ class Parser{
   parseAtom(){
     const k=this.peek();
     if(k.t==='NUM'){this.next();return {k:'num',v:k.v,f:k.f,line:k.line};}
-    if(k.t==='STR'){this.next();return {k:'str',v:k.v,line:k.line};}
-    if(k.t==='FSTR'){this.next();return {k:'fstr',parts:parseFString(k.v,k.line),line:k.line};}
+    if(k.t==='STR'||k.t==='FSTR'){
+      // adjacent string literals join: "a" "b" → "ab"
+      const parts=[];
+      while(this.at('STR')||this.at('FSTR')){
+        const t=this.next();
+        if(t.t==='STR')parts.push({lit:t.v});
+        else parts.push(...parseFString(t.v,t.line));
+      }
+      if(parts.every(p=>'lit' in p))return {k:'str',v:parts.map(p=>p.lit).join(''),line:k.line};
+      return {k:'fstr',parts,line:k.line};
+    }
     if(k.t==='NAME'){this.next();return {k:'name',v:k.v,line:k.line};}
     if(k.t==='KW'){
       if(k.v==='True'){this.next();return {k:'bool',v:true,line:k.line};}
@@ -582,28 +788,64 @@ class Parser{
       if(k.v==='None'){this.next();return {k:'none',line:k.line};}
     }
     if(this.eat('OP','(')){
-      const e=this.parseExpr();
+      if(this.eat('OP',')'))return {k:'tuple',items:[],line:k.line};
+      const first=this.parseExpr();
+      if(this.at('KW','for')){const c=this.parseComp('list',first,null,k.line);this.expect('OP',')');return c;}
+      if(!this.at('OP',',')){this.expect('OP',')');return first;}
+      const items=[first];
+      while(this.eat('OP',',')){if(this.at('OP',')'))break;items.push(this.parseExpr());}
       this.expect('OP',')');
-      return e;
+      return {k:'tuple',items,line:k.line};
     }
     if(this.eat('OP','[')){
-      const items=[];
-      if(!this.at('OP',']')){
-        do{ if(this.at('OP',']'))break; items.push(this.parseExpr()); } while(this.eat('OP',','));
-      }
-      this.expect('OP',']');
+      if(this.eat('OP',']'))return {k:'list',items:[],line:k.line};
+      const first=this.parseExpr();
+      if(this.at('KW','for')){const c=this.parseComp('list',first,null,k.line);this.expect('OP',']');return c;}
+      const items=[first];
+      while(this.eat('OP',',')){if(this.at('OP',']'))break;items.push(this.parseExpr());}
+      this.expect('OP',']',"']' to close the list");
       return {k:'list',items,line:k.line};
     }
-    throw new PyError('SyntaxError',`unexpected ${k.t==='EOF'?'end of file':(k.t==='NEWLINE'?'end of line':`'${k.v}'`)}`,k.line);
+    if(this.eat('OP','{')){
+      if(this.eat('OP','}'))return {k:'dict',keys:[],vals:[],line:k.line};
+      const fk=this.parseExpr();
+      if(!this.at('OP',':'))
+        throw new PyError('SyntaxError',"sets aren't available on the island — use a list, or a dict with key: value pairs",k.line);
+      this.next();
+      const fv=this.parseExpr();
+      if(this.at('KW','for')){const c=this.parseComp('dict',fk,fv,k.line);this.expect('OP','}');return c;}
+      const keys=[fk],vals=[fv];
+      while(this.eat('OP',',')){
+        if(this.at('OP','}'))break;
+        keys.push(this.parseExpr());this.expect('OP',':',"':' between a key and its value");vals.push(this.parseExpr());
+      }
+      this.expect('OP','}',"'}' to close the dictionary");
+      return {k:'dict',keys,vals,line:k.line};
+    }
+    const what=k.t==='EOF'?'end of code':k.t==='NEWLINE'?'end of line':k.t==='INDENT'?'indent':`'${k.v}'`;
+    throw new PyError(k.t==='INDENT'?'IndentationError':'SyntaxError',`unexpected ${what}`,k.line);
   }
 }
 
 function parseExprSrc(src,line){
-  const toks=lex(src);
+  const toks=lex(src).filter(t=>t.t!=='NEWLINE'&&t.t!=='INDENT'&&t.t!=='DEDENT');
+  toks.forEach(t=>t.line=line);
   const p=new Parser(toks);
-  // skip leading NEWLINE-less: lex of a one-liner yields tokens + NEWLINE + EOF
-  const e=p.parseExpr();
+  const e=p.parseTestList();
+  if(!p.at('EOF'))throw new PyError('SyntaxError','f-string: invalid expression',line);
   return e;
+}
+function splitSpec(inner){
+  let depth=0,q=null;
+  for(let i=0;i<inner.length;i++){
+    const c=inner[i];
+    if(q){if(c===q)q=null;continue;}
+    if(c==='"'||c==="'"){q=c;continue;}
+    if('([{'.includes(c))depth++;
+    else if(')]}'.includes(c))depth--;
+    else if(c===':'&&depth===0)return [inner.slice(0,i),inner.slice(i+1)];
+  }
+  return [inner,null];
 }
 function parseFString(raw,line){
   const parts=[]; let lit='';
@@ -619,52 +861,124 @@ function parseFString(raw,line){
         inner+=raw[j];j++;
       }
       if(depth>0) throw new PyError('SyntaxError',"f-string: expected '}'",line);
-      if(lit){parts.push({lit:decodeEscapes(lit,line)});lit='';}
-      if(!inner.trim()) throw new PyError('SyntaxError','f-string: empty expression not allowed',line);
-      parts.push({expr:parseExprSrc(inner,line)});
+      if(lit){parts.push({lit:decodeEscapes(lit)});lit='';}
+      let [expr,spec]=splitSpec(inner);
+      let conv=null;
+      const cm=expr.match(/!([rs])\s*$/);
+      if(cm){conv=cm[1];expr=expr.slice(0,cm.index);}
+      // self-documenting {expr=}
+      if(/[^=!<>]=\s*$/.test(expr)||/^=\s*$/.test(expr)){
+        parts.push({lit:expr});
+        expr=expr.replace(/=\s*$/,'');
+        if(!conv&&!spec)conv='r';
+      }
+      if(!expr.trim()) throw new PyError('SyntaxError','f-string: empty expression not allowed',line);
+      const specParts=spec&&spec.includes('{')?parseFString(spec,line):null;
+      parts.push({expr:parseExprSrc(expr,line),spec:spec||'',specParts,conv});
       i=j;continue;
     }
     if(c==='}') throw new PyError('SyntaxError',"f-string: single '}' is not allowed",line);
     lit+=c;
   }
-  if(lit)parts.push({lit:decodeEscapes(lit,line)});
+  if(lit)parts.push({lit:decodeEscapes(lit)});
   return parts;
 }
 
 /* ---------- runtime ---------- */
 function isNum(v){return v instanceof PyNum;}
+function hashKey(k){
+  if(isNum(k))return 'n:'+k.v;
+  if(typeof k==='boolean')return 'n:'+(k?1:0);
+  if(typeof k==='string')return 's:'+k;
+  if(k===PyNone)return 'N';
+  if(k instanceof PyTuple)return 't:'+JSON.stringify(k.items.map(hashKey));
+  throw new PyError('TypeError',`unhashable type: '${typeName(k)}' — dictionary keys must be numbers, strings or tuples`);
+}
 function typeName(v){
   if(isNum(v))return v.isFloat?'float':'int';
   if(typeof v==='string')return 'str';
   if(typeof v==='boolean')return 'bool';
   if(Array.isArray(v))return 'list';
   if(v===PyNone)return 'NoneType';
-  if(v&&v.pyfunc)return 'function';
+  if(v instanceof PyTuple)return 'tuple';
+  if(v instanceof PyDict)return 'dict';
+  if(v instanceof PyView)return v.kind;
+  if(v&&v.pyrange)return 'range';
+  if(v&&v.pyclass)return 'type';
+  if(v&&v.pyinst)return v.cls.name;
+  if(v&&v.pyexc)return v.kind;
+  if(v&&v.pybound)return 'method';
+  if(v&&(v.pyfunc||v.pybuiltin||v.pynative))return 'function';
   return 'object';
+}
+function seqLen(v){
+  if(typeof v==='string'||Array.isArray(v))return v.length;
+  if(v instanceof PyTuple||v instanceof PyView)return v.items.length;
+  if(v instanceof PyDict)return v.size;
+  if(v&&v.pyrange)return v.items.length;
+  return null;
 }
 function truthy(v){
   if(v===PyNone)return false;
   if(typeof v==='boolean')return v;
   if(isNum(v))return v.v!==0;
-  if(typeof v==='string')return v.length>0;
-  if(Array.isArray(v))return v.length>0;
+  const n=seqLen(v);
+  if(n!==null)return n>0;
   return true;
 }
 function numToStr(n){
-  if(n.isFloat && Number.isInteger(n.v)) return n.v.toFixed(1);
+  if(n.isFloat){
+    if(n.v===Infinity)return 'inf';
+    if(n.v===-Infinity)return '-inf';
+    if(Number.isNaN(n.v))return 'nan';
+    if(Number.isInteger(n.v)&&Math.abs(n.v)<1e16)return n.v.toFixed(1);
+    if(Math.abs(n.v)>=1e16)return n.v.toExponential().replace(/e([+-])(\d)$/,'e$10$2');
+  }
   return String(n.v);
+}
+function classLookup(cls,name){
+  for(let c=cls;c;c=c.base)if(name in c.attrs)return c.attrs[name];
+  return undefined;
 }
 function pyStr(v){
   if(typeof v==='string')return v;
+  if(v&&v.pyexc)return v.kind==='KeyError'&&v.keyRepr!==undefined?v.keyRepr:v.msg;
+  if(v&&v.pyinst){
+    const f=classLookup(v.cls,'__str__')||classLookup(v.cls,'__repr__');
+    if(f&&f.pyfunc&&CUR){
+      const r=CUR.callUser(f,[v],{},CUR.line);
+      if(typeof r!=='string')throw new PyError('TypeError','__str__ returned non-string (type '+typeName(r)+')',CUR.line);
+      return r;
+    }
+  }
   return pyRepr(v);
+}
+function strRepr(s){
+  const q=(s.includes("'")&&!s.includes('"'))?'"':"'";
+  let body=s.replace(/\\/g,'\\\\').replace(/\n/g,'\\n').replace(/\t/g,'\\t');
+  if(q==="'")body=body.replace(/'/g,"\\'");
+  return q+body+q;
 }
 function pyRepr(v){
   if(isNum(v))return numToStr(v);
-  if(typeof v==='string')return "'"+v.replace(/\\/g,'\\\\').replace(/'/g,"\\'")+"'";
+  if(typeof v==='string')return strRepr(v);
   if(typeof v==='boolean')return v?'True':'False';
   if(v===PyNone)return 'None';
   if(Array.isArray(v))return '['+v.map(pyRepr).join(', ')+']';
+  if(v instanceof PyTuple)return v.items.length===1?'('+pyRepr(v.items[0])+',)':'('+v.items.map(pyRepr).join(', ')+')';
+  if(v instanceof PyDict)return '{'+v.entries().map(([k,x])=>pyRepr(k)+': '+pyRepr(x)).join(', ')+'}';
+  if(v instanceof PyView)return `${v.kind}([${v.items.map(pyRepr).join(', ')}])`;
+  if(v&&v.pyrange)return v.step===1?`range(${v.start}, ${v.stop})`:`range(${v.start}, ${v.stop}, ${v.step})`;
+  if(v&&v.pyclass)return `<class '__main__.${v.name}'>`;
+  if(v&&v.pyinst){
+    const f=classLookup(v.cls,'__repr__');
+    if(f&&f.pyfunc&&CUR)return pyStr(CUR.callUser(f,[v],{},CUR.line));
+    return `<__main__.${v.cls.name} object>`;
+  }
+  if(v&&v.pyexc)return `${v.kind}(${v.msg===''?'':strRepr(v.msg)})`;
   if(v&&v.pyfunc)return `<function ${v.name}>`;
+  if(v&&v.pybound)return `<bound method ${v.self.cls.name}.${v.fn.name}>`;
+  if(v&&(v.pybuiltin||v.pynative))return `<built-in function ${v.name||''}>`;
   return String(v);
 }
 function pyEq(a,b){
@@ -672,63 +986,180 @@ function pyEq(a,b){
   if(typeof a==='boolean'&&isNum(b))return (a?1:0)===b.v;
   if(isNum(a)&&typeof b==='boolean')return a.v===(b?1:0);
   if(typeof a===typeof b && (typeof a==='string'||typeof a==='boolean'))return a===b;
-  if(Array.isArray(a)&&Array.isArray(b)){
-    if(a.length!==b.length)return false;
-    return a.every((x,i)=>pyEq(x,b[i]));
+  if(Array.isArray(a)&&Array.isArray(b))return a.length===b.length&&a.every((x,i)=>pyEq(x,b[i]));
+  if(a instanceof PyTuple&&b instanceof PyTuple)return a.items.length===b.items.length&&a.items.every((x,i)=>pyEq(x,b.items[i]));
+  if(a instanceof PyDict&&b instanceof PyDict){
+    if(a.size!==b.size)return false;
+    return a.entries().every(([k,v])=>b.has(k)&&pyEq(v,b.get(k)));
   }
-  if(a===PyNone||b===PyNone)return a===b;
   return a===b;
+}
+function pyCmp(a,b,line,op){
+  const num=x=>isNum(x)||typeof x==='boolean';
+  if(num(a)&&num(b)){const x=toNum(a).v,y=toNum(b).v;return x<y?-1:x>y?1:0;}
+  if(typeof a==='string'&&typeof b==='string')return a<b?-1:a>b?1:0;
+  const seq=x=>Array.isArray(x)?x:(x instanceof PyTuple?x.items:null);
+  const sa=seq(a),sb=seq(b);
+  if(sa&&sb&&Array.isArray(a)===Array.isArray(b)){
+    for(let i=0;i<Math.min(sa.length,sb.length);i++){
+      if(!pyEq(sa[i],sb[i]))return pyCmp(sa[i],sb[i],line,op);
+    }
+    return sa.length-sb.length<0?-1:sa.length>sb.length?1:0;
+  }
+  throw new PyError('TypeError',`'${op||'<'}' not supported between '${typeName(a)}' and '${typeName(b)}'`,line);
 }
 function toNum(v,line,ctx){
   if(isNum(v))return v;
   if(typeof v==='boolean')return new PyNum(v?1:0,false);
-  throw new PyError('TypeError',`${ctx||'this operation'} needs a number, but got ${typeName(v)}`,line);
+  throw new PyError('TypeError',`${ctx||'this operation'} needs a number, but got ${typeName(v)}${typeof v==='string'?' — use int() or float() to convert text to a number':''}`,line);
 }
+function toInt(v,line,ctx){
+  const n=toNum(v,line,ctx);
+  if(n.isFloat)throw new PyError('TypeError',`${ctx} needs a whole number (int), not a float`,line);
+  return n.v;
+}
+function excMatches(name,kind){
+  if(name===kind||name==='Exception'||name==='BaseException')return true;
+  if(name==='ArithmeticError')return kind==='ZeroDivisionError';
+  if(name==='LookupError')return kind==='IndexError'||kind==='KeyError';
+  return false;
+}
+// Number.toFixed, but exact ties round half-to-even like Python
+function toFixedPy(a,p){
+  const s=a.toFixed(Math.min(100,p+25));
+  const dot=s.indexOf('.');
+  const tail=s.slice(dot+p+1);
+  if(/^50*$/.test(tail)){
+    const trunc=p===0?s.slice(0,dot):s.slice(0,dot+p+1);
+    if(+trunc.replace('.','').slice(-1)%2===0)return trunc;
+  }
+  return a.toFixed(p);
+}
+function formatValue(v,spec,line){
+  if(spec==='')return pyStr(v);
+  const m=spec.match(/^(?:([^{}])?([<>^=]))?([+\- ])?(0)?(\d+)?([,_])?(?:\.(\d+))?([sdfFeE%xXbo])?$/);
+  if(!m)throw new PyError('ValueError',`invalid format spec '${spec}'`,line);
+  let [,fill,align,sign,zero,width,group,prec,type]=m;
+  const numeric=isNum(v)||(typeof v==='boolean'&&type&&type!=='s');
+  let s;
+  if(numeric&&type!=='s'){
+    const nv=toNum(v,line,'format');const n=nv.v;const a=Math.abs(n);
+    let body;
+    if(type==='f'||type==='F'||type==='%'){const p=prec===undefined?6:+prec;body=toFixedPy(type==='%'?a*100:a,p);}
+    else if(type==='e'||type==='E'){body=a.toExponential(prec===undefined?6:+prec).replace(/e([+-])(\d)$/,'e$10$2');if(type==='E')body=body.toUpperCase();}
+    else if(type==='d'){
+      if(nv.isFloat)throw new PyError('ValueError',"format code 'd' can't be used with a float — try .0f, or int() first",line);
+      body=String(a);
+    }
+    else if('xXbo'.includes(type||'@')){
+      if(nv.isFloat)throw new PyError('ValueError',`format code '${type}' can't be used with a float`,line);
+      body=a.toString(type==='b'?2:type==='o'?8:16);if(type==='X')body=body.toUpperCase();
+    }
+    else if(prec!==undefined){body=String(Number(a.toPrecision(Math.max(1,+prec))));}
+    else body=numToStr(new PyNum(a,nv.isFloat));
+    if(group){const [ip,fp]=body.split('.');body=ip.replace(/\B(?=(\d{3})+(?!\d))/g,group)+(fp!==undefined?'.'+fp:'');}
+    if(type==='%')body+='%';
+    const neg=n<0||Object.is(n,-0);
+    const sg=neg?'-':(sign==='+'?'+':sign===' '?' ':'');
+    const w=+(width||0);
+    if((zero&&!align)||align==='='){
+      const f=align==='='?(fill||' '):'0';
+      return sg+body.padStart(Math.max(0,w-sg.length),f);
+    }
+    s=sg+body;
+  } else {
+    if(type&&type!=='s')throw new PyError('ValueError',`format code '${type}' needs a number, but got ${typeName(v)}`,line);
+    s=pyStr(v);
+    if(prec!==undefined)s=s.slice(0,+prec);
+  }
+  const w=+(width||0);
+  if(s.length>=w)return s;
+  const f=fill||' ';const al=align||(numeric?'>':'<');
+  const pad=w-s.length;
+  if(al==='<')return s+f.repeat(pad);
+  if(al==='>'||al==='=')return f.repeat(pad)+s;
+  const l=Math.floor(pad/2);return f.repeat(l)+s+f.repeat(pad-l);
+}
+function makeExc(kind,msg){return {pyexc:true,kind,msg};}
 
 class Interp{
   constructor(){
-    this.out=[]; this.curLine=''; this.steps=0;
+    this.out=[]; this.curLine=''; this.steps=0; this.depth=0; this.line=0; this.handling=null;
   }
   emit(s){
-    // handle newlines inside printed strings
     const parts=(this.curLine+s).split('\n');
     this.curLine=parts.pop();
     for(const p of parts)this.out.push(p);
   }
   endline(){this.out.push(this.curLine);this.curLine='';}
   tick(line){
-    if(++this.steps>200000)
-      throw new PyError('RuntimeError','your program ran for too long — check for an infinite loop',line);
+    if(line)this.line=line;
+    if(++this.steps>400000)
+      throw new PyError('RuntimeError','your program ran for too long — check for an infinite loop',line,true);
   }
   run(src){
     const toks=lex(src);
     const prog=new Parser(toks).parseProgram();
     const env={vars:Object.create(null),parent:null};
-    this.execBlock(prog,env);
-    if(this.curLine!=='')this.endline();
+    const prev=CUR;CUR=this;
+    try{this.execBlock(prog,env);}
+    finally{CUR=prev;if(this.curLine!=='')this.endline();}
   }
   execBlock(block,env){for(const s of block.body)this.execStmt(s,env);}
+  iterate(v,line){
+    if(Array.isArray(v))return v.slice();
+    if(typeof v==='string')return [...v];
+    if(v instanceof PyTuple||v instanceof PyView)return v.items.slice();
+    if(v instanceof PyDict)return v.keys();
+    if(v&&v.pyrange)return v.items;
+    throw new PyError('TypeError',`'${typeName(v)}' object is not iterable`,line);
+  }
+  assignTo(t,val,env,line){
+    switch(t.k){
+      case 'name':this.store(t.v,val,env);return;
+      case 'tuple':case 'list':{
+        const items=this.iterate(val,line);
+        if(items.length!==t.items.length)
+          throw new PyError('ValueError',items.length>t.items.length
+            ?`too many values to unpack (expected ${t.items.length})`
+            :`not enough values to unpack (expected ${t.items.length}, got ${items.length})`,line);
+        t.items.forEach((x,i)=>this.assignTo(x,items[i],env,line));
+        return;
+      }
+      case 'index':{
+        const obj=this.evalExpr(t.obj,env),idx=this.evalExpr(t.idx,env);
+        if(Array.isArray(obj)){obj[this.checkIndex(obj,idx,line,'list')]=val;return;}
+        if(obj instanceof PyDict){this.withLine(line,()=>obj.set(idx,val));return;}
+        throw new PyError('TypeError',`'${typeName(obj)}' object does not support item assignment${obj instanceof PyTuple?' — tuples can\'t be changed once made':typeof obj==='string'?' — strings can\'t be changed; build a new one instead':''}`,line);
+      }
+      case 'attr':{
+        const obj=this.evalExpr(t.obj,env);
+        if(obj&&(obj.pyinst||obj.pyclass)){obj.attrs[t.name]=val;return;}
+        throw new PyError('AttributeError',`can't set attributes on a '${typeName(obj)}' object`,line);
+      }
+    }
+    throw new PyError('SyntaxError','cannot assign to this expression',line);
+  }
+  withLine(line,f){
+    try{return f();}catch(e){if(e instanceof PyError&&!e.pyline)e.pyline=line;throw e;}
+  }
   execStmt(s,env){
     this.tick(s.line);
     switch(s.k){
       case 'exprstmt': this.evalExpr(s.expr,env); return;
       case 'assign':{
-        let val=this.evalExpr(s.val,env);
-        if(s.op!=='='){
-          const cur=(s.target.k==='name')
-            ? this.lookup(s.target.v,env,s.line)
-            : this.evalExpr(s.target,env);
-          val=this.binop(s.op[0],cur,val,s.line);
+        if(s.op==='='){
+          const val=this.evalExpr(s.val,env);
+          for(const t of s.targets)this.assignTo(t,val,env,s.line);
+          return;
         }
-        if(s.target.k==='name'){
-          this.store(s.target.v,val,env);
-        } else {
-          const obj=this.evalExpr(s.target.obj,env);
-          const idx=this.evalExpr(s.target.idx,env);
-          if(!Array.isArray(obj))throw new PyError('TypeError',`'${typeName(obj)}' does not support item assignment`,s.line);
-          const i=this.checkIndex(obj,idx,s.line);
-          obj[i]=val;
-        }
+        const t=s.targets[0];
+        const cur=this.evalExpr(t,env);
+        const rhs=this.evalExpr(s.val,env);
+        let val;
+        if(Array.isArray(cur)&&s.op==='+='){cur.push(...this.iterate(rhs,s.line));val=cur;}
+        else val=this.binop(s.op.slice(0,-1),cur,rhs,s.line);
+        this.assignTo(t,val,env,s.line);
         return;
       }
       case 'if':
@@ -747,15 +1178,10 @@ class Interp{
         }
         return;
       case 'for':{
-        const it=this.evalExpr(s.iter,env);
-        let seq;
-        if(Array.isArray(it))seq=it.slice();
-        else if(typeof it==='string')seq=[...it];
-        else if(it&&it.pyrange)seq=it.items;
-        else throw new PyError('TypeError',`'${typeName(it)}' object is not iterable`,s.line);
+        const seq=this.iterate(this.evalExpr(s.iter,env),s.line);
         for(const item of seq){
           this.tick(s.line);
-          this.store(s.name,item,env);
+          this.assignTo(s.target,item,env,s.line);
           try{this.execBlock(s.body,env);}
           catch(e){
             if(e instanceof BreakSig)break;
@@ -766,27 +1192,124 @@ class Interp{
         return;
       }
       case 'def':
-        this.store(s.name,{pyfunc:true,name:s.name,params:s.params,body:s.body,defEnv:env},env);
+        this.store(s.name,{pyfunc:true,name:s.name,params:s.params,
+          defaults:s.defaults.map(d=>d?this.evalExpr(d,env):undefined),body:s.body,defEnv:env},env);
         return;
+      case 'class':{
+        const base=s.base?this.evalExpr(s.base,env):null;
+        if(base&&!base.pyclass)
+          throw new PyError('TypeError','a class can only inherit from another class defined in your code',s.line);
+        const cenv={vars:Object.create(null),parent:env};
+        this.execBlock(s.body,cenv);
+        this.store(s.name,{pyclass:true,name:s.name,base,attrs:cenv.vars},env);
+        return;
+      }
       case 'return':
         throw new ReturnSig(s.val?this.evalExpr(s.val,env):PyNone);
       case 'break': throw new BreakSig();
       case 'continue': throw new ContinueSig();
       case 'pass': return;
+      case 'raise':{
+        if(!s.exc){
+          if(this.handling)throw this.handling;
+          throw new PyError('RuntimeError','No active exception to re-raise',s.line);
+        }
+        let ex=this.evalExpr(s.exc,env);
+        if(ex&&ex.pybuiltin&&ex.excKind)ex=makeExc(ex.excKind,'');
+        if(!ex||!ex.pyexc)
+          throw new PyError('TypeError','you can only raise exceptions, like raise ValueError("message")',s.line);
+        const err=new PyError(ex.kind,ex.msg,s.line);err.obj=ex;
+        throw err;
+      }
+      case 'try':{
+        let ok=false;
+        try{
+          try{this.execBlock(s.body,env);ok=true;}
+          catch(e){
+            if(!(e instanceof PyError)||e.fatal)throw e;
+            const h=s.handlers.find(h=>{
+              if(!h.types)return true;
+              return h.types.some(t=>{
+                if(!(t in BUILTIN_NAMES)||!BUILTIN_NAMES[t].excKind){
+                  if(!this.lookupOpt(t,env))throw new PyError('NameError',`name '${t}' is not defined`,h.line);
+                  throw new PyError('TypeError',`'${t}' is not an exception type`,h.line);
+                }
+                return excMatches(t,e.kind);
+              });
+            });
+            if(!h)throw e;
+            const obj=e.obj||Object.assign(makeExc(e.kind,e.message),e.keyRepr!==undefined?{keyRepr:e.keyRepr}:{});
+            if(h.as)this.store(h.as,obj,env);
+            const prev=this.handling;this.handling=e;
+            try{this.execBlock(h.body,env);}finally{this.handling=prev;}
+          }
+          if(ok&&s.orelse)this.execBlock(s.orelse,env);
+        } finally {
+          if(s.final)this.execBlock(s.final,env);
+        }
+        return;
+      }
+      case 'del':{
+        for(const t of s.targets){
+          if(t.k==='name'){
+            let e=env;while(e&&!(t.v in e.vars))e=e.parent;
+            if(!e)throw new PyError('NameError',`name '${t.v}' is not defined`,s.line);
+            delete e.vars[t.v];continue;
+          }
+          const obj=this.evalExpr(t.obj,env),idx=this.evalExpr(t.idx,env);
+          if(Array.isArray(obj)){obj.splice(this.checkIndex(obj,idx,s.line,'list'),1);continue;}
+          if(obj instanceof PyDict){
+            if(!this.withLine(s.line,()=>obj.del(idx)))this.keyError(idx,s.line);
+            continue;
+          }
+          throw new PyError('TypeError',`'${typeName(obj)}' object doesn't support item deletion`,s.line);
+        }
+        return;
+      }
     }
+  }
+  keyError(k,line){
+    const e=new PyError('KeyError',pyRepr(k),line);e.keyRepr=pyRepr(k);throw e;
+  }
+  lookupOpt(name,env){
+    for(let e=env;e;e=e.parent)if(name in e.vars)return true;
+    return false;
   }
   lookup(name,env,line){
     for(let e=env;e;e=e.parent)if(name in e.vars)return e.vars[name];
     if(name in BUILTIN_NAMES)return BUILTIN_NAMES[name];
-    throw new PyError('NameError',`name '${name}' is not defined`,line);
+    const hint=name==='true'||name==='false'?` — did you mean ${name[0].toUpperCase()+name.slice(1)}?`
+      :name==='none'||name==='null'?' — did you mean None?':'';
+    throw new PyError('NameError',`name '${name}' is not defined${hint}`,line);
   }
   store(name,val,env){env.vars[name]=val;}
-  checkIndex(arr,idx,line){
-    if(!isNum(idx)||idx.isFloat)throw new PyError('TypeError','list indices must be integers',line);
+  checkIndex(arr,idx,line,what){
+    if(typeof idx==='boolean')idx=new PyNum(idx?1:0,false);
+    if(!isNum(idx)||idx.isFloat)throw new PyError('TypeError',`${what||'list'} indices must be integers, not ${typeName(idx)}`,line);
     let i=idx.v;
     if(i<0)i+=arr.length;
-    if(i<0||i>=arr.length)throw new PyError('IndexError','list index out of range',line);
+    if(i<0||i>=arr.length)throw new PyError('IndexError',`${what||'list'} index out of range`,line);
     return i;
+  }
+  sliceIdx(n,lo,hi,step,line){
+    const get=(v,name)=>{
+      if(v===PyNone||v===undefined||v===null)return null;
+      return toInt(v,line,'slice '+name);
+    };
+    let st=get(step,'step');if(st===null)st=1;
+    if(st===0)throw new PyError('ValueError','slice step cannot be zero',line);
+    let a=get(lo,'start'),b=get(hi,'stop');
+    const idx=[];
+    if(st>0){
+      a=a===null?0:(a<0?Math.max(0,a+n):Math.min(a,n));
+      b=b===null?n:(b<0?Math.max(0,b+n):Math.min(b,n));
+      for(let i=a;i<b;i+=st)idx.push(i);
+    } else {
+      a=a===null?n-1:(a<0?Math.max(-1,a+n):Math.min(a,n-1));
+      b=b===null?-1:(b<0?Math.max(-1,b+n):Math.min(b,n-1));
+      for(let i=a;i>b;i+=st)idx.push(i);
+    }
+    return idx;
   }
   binop(op,a,b,line){
     if(op==='+'){
@@ -794,10 +1317,21 @@ class Interp{
       if(typeof a==='string'||typeof b==='string')
         throw new PyError('TypeError',`can only join str with str — use str() or an f-string to mix in a ${typeName(typeof a==='string'?b:a)}`,line);
       if(Array.isArray(a)&&Array.isArray(b))return a.concat(b);
+      if(a instanceof PyTuple&&b instanceof PyTuple)return new PyTuple(a.items.concat(b.items));
+      if(Array.isArray(a)||Array.isArray(b)||a instanceof PyTuple||b instanceof PyTuple)
+        throw new PyError('TypeError',`can't add ${typeName(a)} and ${typeName(b)} together`,line);
     }
     if(op==='*'){
-      if(typeof a==='string'&&isNum(b)&&!b.isFloat)return a.repeat(Math.max(0,b.v));
-      if(typeof b==='string'&&isNum(a)&&!a.isFloat)return b.repeat(Math.max(0,a.v));
+      const rep=(s,n)=>{
+        if(!isNum(n)||n.isFloat)return null;
+        const k=Math.max(0,n.v);
+        if(typeof s==='string')return s.repeat(k);
+        if(Array.isArray(s)){const r=[];for(let i=0;i<k;i++)r.push(...s);return r;}
+        if(s instanceof PyTuple){const r=[];for(let i=0;i<k;i++)r.push(...s.items);return new PyTuple(r);}
+        return null;
+      };
+      const r=rep(a,b);if(r!==null)return r;
+      const r2=rep(b,a);if(r2!==null)return r2;
     }
     const x=toNum(a,line,`'${op}'`),y=toNum(b,line,`'${op}'`);
     const f=x.isFloat||y.isFloat;
@@ -809,17 +1343,51 @@ class Interp{
         if(y.v===0)throw new PyError('ZeroDivisionError','division by zero',line);
         return new PyNum(x.v/y.v,true);
       case '//':
-        if(y.v===0)throw new PyError('ZeroDivisionError','integer division by zero',line);
+        if(y.v===0)throw new PyError('ZeroDivisionError','integer division or modulo by zero',line);
         return new PyNum(Math.floor(x.v/y.v),f);
       case '%':
-        if(y.v===0)throw new PyError('ZeroDivisionError','modulo by zero',line);
-        return new PyNum(((x.v%y.v)+y.v)%y.v,f);
+        if(y.v===0)throw new PyError('ZeroDivisionError','integer modulo by zero',line);
+        return new PyNum(x.v-Math.floor(x.v/y.v)*y.v,f);
       case '**':{
+        if(x.v===0&&y.v<0)throw new PyError('ZeroDivisionError','0 cannot be raised to a negative power',line);
         const r=Math.pow(x.v,y.v);
-        return new PyNum(r,f||!Number.isInteger(r));
+        return new PyNum(r,f||y.v<0);
       }
     }
     throw new PyError('SyntaxError',`unsupported operator '${op}'`,line);
+  }
+  contains(cont,item,line){
+    if(typeof cont==='string'){
+      if(typeof item!=='string')throw new PyError('TypeError',`'in <string>' requires a string on the left, not ${typeName(item)}`,line);
+      return cont.includes(item);
+    }
+    if(Array.isArray(cont))return cont.some(x=>pyEq(x,item));
+    if(cont instanceof PyTuple||cont instanceof PyView)return cont.items.some(x=>pyEq(x,item));
+    if(cont instanceof PyDict)return this.withLine(line,()=>cont.has(item));
+    if(cont&&cont.pyrange)return cont.items.some(x=>pyEq(x,item));
+    throw new PyError('TypeError',`argument of type '${typeName(cont)}' is not iterable`,line);
+  }
+  compare(op,a,b,line){
+    switch(op){
+      case '==':return pyEq(a,b);
+      case '!=':return !pyEq(a,b);
+      case 'in':return this.contains(b,a,line);
+      case 'not in':return !this.contains(b,a,line);
+      case 'is':case 'is not':{
+        let same;
+        if(isNum(a)&&isNum(b))same=a.v===b.v&&a.isFloat===b.isFloat;
+        else same=a===b;
+        return op==='is'?same:!same;
+      }
+    }
+    const c=pyCmp(a,b,line,op);
+    switch(op){
+      case '<':return c<0; case '>':return c>0;
+      case '<=':return c<=0; case '>=':return c>=0;
+    }
+  }
+  makeFunc(name,params,defaults,body,env){
+    return {pyfunc:true,name,params,defaults,body,defEnv:env};
   }
   evalExpr(e,env){
     this.tick(e.line);
@@ -830,11 +1398,24 @@ class Interp{
       case 'none':return PyNone;
       case 'name':return this.lookup(e.v,env,e.line);
       case 'list':return e.items.map(x=>this.evalExpr(x,env));
+      case 'tuple':return new PyTuple(e.items.map(x=>this.evalExpr(x,env)));
+      case 'dict':{
+        const d=new PyDict();
+        e.keys.forEach((k,i)=>{
+          const kv=this.evalExpr(k,env),vv=this.evalExpr(e.vals[i],env);
+          this.withLine(e.line,()=>d.set(kv,vv));
+        });
+        return d;
+      }
       case 'fstr':{
         let s='';
         for(const p of e.parts){
           if('lit' in p)s+=p.lit;
-          else s+=pyStr(this.evalExpr(p.expr,env));
+          else {
+            const v=this.evalExpr(p.expr,env);
+            const spec=p.specParts?this.evalExpr({k:'fstr',parts:p.specParts,line:e.line},env):p.spec;
+            s+=p.conv==='r'?formatValue(pyRepr(v),spec,e.line):formatValue(v,spec,e.line);
+          }
         }
         return s;
       }
@@ -851,131 +1432,373 @@ class Interp{
         const l=this.evalExpr(e.l,env);
         return truthy(l)?l:this.evalExpr(e.r,env);
       }
+      case 'ifexp':
+        return truthy(this.evalExpr(e.test,env))?this.evalExpr(e.body,env):this.evalExpr(e.orelse,env);
       case 'cmp':{
-        const a=this.evalExpr(e.l,env),b=this.evalExpr(e.r,env);
-        if(e.op==='==')return pyEq(a,b);
-        if(e.op==='!=')return !pyEq(a,b);
-        let x,y;
-        if(typeof a==='string'&&typeof b==='string'){x=a;y=b;}
-        else {x=toNum(a,e.line,`'${e.op}'`).v;y=toNum(b,e.line,`'${e.op}'`).v;}
-        switch(e.op){
-          case '<':return x<y; case '>':return x>y;
-          case '<=':return x<=y; case '>=':return x>=y;
+        let left=this.evalExpr(e.operands[0],env);
+        for(let i=0;i<e.ops.length;i++){
+          const right=this.evalExpr(e.operands[i+1],env);
+          if(!this.compare(e.ops[i],left,right,e.line))return false;
+          left=right;
         }
-        break;
-      }
-      case 'in':{
-        const item=this.evalExpr(e.l,env),cont=this.evalExpr(e.r,env);
-        if(typeof cont==='string'){
-          if(typeof item!=='string')throw new PyError('TypeError',`'in <string>' requires string on the left`,e.line);
-          return cont.includes(item);
-        }
-        if(Array.isArray(cont))return cont.some(x=>pyEq(x,item));
-        if(cont&&cont.pyrange)return cont.items.some(x=>pyEq(x,item));
-        throw new PyError('TypeError',`argument of type '${typeName(cont)}' is not iterable`,e.line);
+        return true;
       }
       case 'bin':return this.binop(e.op,this.evalExpr(e.l,env),this.evalExpr(e.r,env),e.line);
       case 'index':{
         const obj=this.evalExpr(e.obj,env);
         const idx=this.evalExpr(e.idx,env);
-        if(typeof obj==='string'){
-          if(!isNum(idx)||idx.isFloat)throw new PyError('TypeError','string indices must be integers',e.line);
-          let i=idx.v; if(i<0)i+=obj.length;
-          if(i<0||i>=obj.length)throw new PyError('IndexError','string index out of range',e.line);
-          return obj[i];
+        if(typeof obj==='string')return obj[this.checkIndex(obj,idx,e.line,'string')];
+        if(Array.isArray(obj))return obj[this.checkIndex(obj,idx,e.line,'list')];
+        if(obj instanceof PyTuple)return obj.items[this.checkIndex(obj.items,idx,e.line,'tuple')];
+        if(obj&&obj.pyrange)return obj.items[this.checkIndex(obj.items,idx,e.line,'range')];
+        if(obj instanceof PyDict){
+          const v=this.withLine(e.line,()=>obj.get(idx));
+          if(v===undefined)this.keyError(idx,e.line);
+          return v;
         }
-        if(Array.isArray(obj))return obj[this.checkIndex(obj,idx,e.line)];
         throw new PyError('TypeError',`'${typeName(obj)}' object is not subscriptable`,e.line);
       }
-      case 'attr':{
+      case 'slice':{
         const obj=this.evalExpr(e.obj,env);
-        return this.getMethod(obj,e.name,e.line);
+        const ev=x=>x?this.evalExpr(x,env):null;
+        const lo=ev(e.lo),hi=ev(e.hi),st=ev(e.step);
+        if(typeof obj==='string')return this.sliceIdx(obj.length,lo,hi,st,e.line).map(i=>obj[i]).join('');
+        if(Array.isArray(obj))return this.sliceIdx(obj.length,lo,hi,st,e.line).map(i=>obj[i]);
+        if(obj instanceof PyTuple)return new PyTuple(this.sliceIdx(obj.items.length,lo,hi,st,e.line).map(i=>obj.items[i]));
+        if(obj&&obj.pyrange)return this.sliceIdx(obj.items.length,lo,hi,st,e.line).map(i=>obj.items[i]);
+        throw new PyError('TypeError',`'${typeName(obj)}' object can't be sliced`,e.line);
       }
+      case 'attr':return this.getAttr(this.evalExpr(e.obj,env),e.name,e.line);
       case 'call':{
         const fn=this.evalExpr(e.fn,env);
         const args=e.args.map(a=>this.evalExpr(a,env));
-        return this.callFn(fn,args,e.line);
+        const kw={};
+        for(const k of e.kwargs)kw[k.name]=this.evalExpr(k.val,env);
+        return this.callFn(fn,args,kw,e.line);
+      }
+      case 'lambda':
+        return this.makeFunc('<lambda>',e.params,e.defaults.map(d=>d?this.evalExpr(d,env):undefined),
+          {k:'block',body:[{k:'return',val:e.body,line:e.line}]},env);
+      case 'comp':{
+        const out=e.kind==='dict'?new PyDict():[];
+        const local={vars:Object.create(null),parent:env};
+        const loop=gi=>{
+          if(gi===e.gens.length){
+            if(e.kind==='dict'){
+              const k=this.evalExpr(e.elt,local),v=this.evalExpr(e.val,local);
+              this.withLine(e.line,()=>out.set(k,v));
+            } else out.push(this.evalExpr(e.elt,local));
+            return;
+          }
+          const g=e.gens[gi];
+          for(const item of this.iterate(this.evalExpr(g.iter,local),e.line)){
+            this.tick(e.line);
+            this.assignTo(g.target,item,local,e.line);
+            if(g.conds.every(c=>truthy(this.evalExpr(c,local))))loop(gi+1);
+          }
+        };
+        loop(0);
+        return out;
       }
     }
     throw new PyError('RuntimeError','unsupported expression',e.line);
   }
-  getMethod(obj,name,line){
+  getAttr(obj,name,line){
+    if(obj&&obj.pyinst){
+      if(name in obj.attrs)return obj.attrs[name];
+      const v=classLookup(obj.cls,name);
+      if(v!==undefined)return (v&&v.pyfunc)?{pybound:true,fn:v,self:obj,name}:v;
+      throw new PyError('AttributeError',`'${obj.cls.name}' object has no attribute '${name}'`,line);
+    }
+    if(obj&&obj.pyclass){
+      const v=classLookup(obj,name);
+      if(v!==undefined)return v;
+      throw new PyError('AttributeError',`type object '${obj.name}' has no attribute '${name}'`,line);
+    }
+    if(obj&&obj.pyexc&&name==='args')return new PyTuple(obj.msg===''?[]:[obj.msg]);
+    const m=this.nativeMethod(obj,name,line);
+    if(m)return {pynative:true,name,call:m};
+    throw new PyError('AttributeError',`'${typeName(obj)}' object has no attribute '${name}'`,line);
+  }
+  nativeMethod(obj,name,line){
     const self=this;
+    const argc=(a,lo,hi,fname)=>{
+      if(a.length<lo||a.length>hi)
+        throw new PyError('TypeError',`${fname||name}() takes ${lo===hi?lo:`${lo} to ${hi}`} argument${hi===1?'':'s'} (${a.length} given)`,line);
+    };
+    const needStr=(v,fname)=>{if(typeof v!=='string')throw new PyError('TypeError',`${fname||name}() needs a string argument, not ${typeName(v)}`,line);return v;};
     if(Array.isArray(obj)){
       const m={
-        append:(a)=>{if(a.length!==1)throw new PyError('TypeError','append() takes exactly one argument',line);obj.push(a[0]);return PyNone;},
-        pop:(a)=>{
+        append:a=>{argc(a,1,1);obj.push(a[0]);return PyNone;},
+        extend:a=>{argc(a,1,1);obj.push(...self.iterate(a[0],line));return PyNone;},
+        insert:a=>{argc(a,2,2);let i=toInt(a[0],line,'insert()');if(i<0)i=Math.max(0,i+obj.length);obj.splice(Math.min(i,obj.length),0,a[1]);return PyNone;},
+        pop:a=>{
+          argc(a,0,1);
           if(obj.length===0)throw new PyError('IndexError','pop from empty list',line);
           if(a.length===0)return obj.pop();
-          const i=self.checkIndex(obj,a[0],line);
-          return obj.splice(i,1)[0];
+          return obj.splice(self.checkIndex(obj,a[0],line,'pop'),1)[0];
         },
-        remove:(a)=>{
+        remove:a=>{
+          argc(a,1,1);
           const i=obj.findIndex(x=>pyEq(x,a[0]));
           if(i<0)throw new PyError('ValueError','list.remove(x): x not in list',line);
           obj.splice(i,1);return PyNone;
         },
+        index:a=>{
+          argc(a,1,1);
+          const i=obj.findIndex(x=>pyEq(x,a[0]));
+          if(i<0)throw new PyError('ValueError',`${pyRepr(a[0])} is not in list`,line);
+          return new PyNum(i,false);
+        },
+        count:a=>{argc(a,1,1);return new PyNum(obj.filter(x=>pyEq(x,a[0])).length,false);},
+        reverse:a=>{argc(a,0,0);obj.reverse();return PyNone;},
+        clear:a=>{argc(a,0,0);obj.length=0;return PyNone;},
+        copy:a=>{argc(a,0,0);return obj.slice();},
+        sort:(a,kw)=>{
+          if(a.length)throw new PyError('TypeError','sort() takes no positional arguments — use sort(key=..., reverse=True)',line);
+          const sorted=self.sortList(obj,kw,line);
+          obj.length=0;obj.push(...sorted);return PyNone;
+        },
       }[name];
-      if(m)return {pynative:true,name,call:m};
+      if(m)return m;
+    }
+    if(obj instanceof PyTuple){
+      const m={
+        count:a=>{argc(a,1,1);return new PyNum(obj.items.filter(x=>pyEq(x,a[0])).length,false);},
+        index:a=>{argc(a,1,1);const i=obj.items.findIndex(x=>pyEq(x,a[0]));
+          if(i<0)throw new PyError('ValueError','tuple.index(x): x not in tuple',line);return new PyNum(i,false);},
+      }[name];
+      if(m)return m;
+    }
+    if(obj instanceof PyDict){
+      const m={
+        get:a=>{argc(a,1,2);const v=self.withLine(line,()=>obj.get(a[0]));return v===undefined?(a.length>1?a[1]:PyNone):v;},
+        keys:a=>{argc(a,0,0);return new PyView('dict_keys',obj.keys());},
+        values:a=>{argc(a,0,0);return new PyView('dict_values',obj.values());},
+        items:a=>{argc(a,0,0);return new PyView('dict_items',obj.entries().map(([k,v])=>new PyTuple([k,v])));},
+        pop:a=>{
+          argc(a,1,2);const v=self.withLine(line,()=>obj.get(a[0]));
+          if(v===undefined){if(a.length>1)return a[1];self.keyError(a[0],line);}
+          obj.del(a[0]);return v;
+        },
+        setdefault:a=>{argc(a,1,2);let v=obj.get(a[0]);if(v===undefined){v=a.length>1?a[1]:PyNone;obj.set(a[0],v);}return v;},
+        update:a=>{argc(a,1,1);if(!(a[0] instanceof PyDict))throw new PyError('TypeError','update() needs a dict',line);
+          for(const [k,v] of a[0].entries())obj.set(k,v);return PyNone;},
+        copy:a=>{argc(a,0,0);const d=new PyDict();for(const [k,v] of obj.entries())d.set(k,v);return d;},
+        clear:a=>{argc(a,0,0);obj.m.clear();return PyNone;},
+      }[name];
+      if(m)return m;
     }
     if(typeof obj==='string'){
+      const strip=(a,mode)=>{
+        argc(a,0,1);
+        const chars=a.length&&a[0]!==PyNone?needStr(a[0]):null;
+        const isS=c=>chars===null?/\s/.test(c):chars.includes(c);
+        let i=0,j=obj.length;
+        if(mode!=='r')while(i<j&&isS(obj[i]))i++;
+        if(mode!=='l')while(j>i&&isS(obj[j-1]))j--;
+        return obj.slice(i,j);
+      };
+      const pad=(a,how)=>{
+        argc(a,1,2);const w=toInt(a[0],line,name+'()');const f=a.length>1?needStr(a[1]):' ';
+        if(obj.length>=w)return obj;
+        const n=w-obj.length;
+        if(how==='l')return obj+f.repeat(n);
+        if(how==='r')return f.repeat(n)+obj;
+        const left=Math.floor(n/2)+((n%2)&(w%2));
+        return f.repeat(left)+obj+f.repeat(n-left);
+      };
       const m={
-        upper:()=>obj.toUpperCase(),
-        lower:()=>obj.toLowerCase(),
-        title:()=>obj.replace(/\b\w/g,c=>c.toUpperCase()),
-        strip:()=>obj.trim(),
-        replace:(a)=>{
-          if(a.length!==2||typeof a[0]!=='string'||typeof a[1]!=='string')
-            throw new PyError('TypeError','replace() takes two string arguments',line);
+        upper:a=>{argc(a,0,0);return obj.toUpperCase();},
+        lower:a=>{argc(a,0,0);return obj.toLowerCase();},
+        title:a=>{argc(a,0,0);return obj.toLowerCase().replace(/(^|[^A-Za-z])([a-z])/g,(x,p,c)=>p+c.toUpperCase());},
+        capitalize:a=>{argc(a,0,0);return obj.charAt(0).toUpperCase()+obj.slice(1).toLowerCase();},
+        swapcase:a=>{argc(a,0,0);return [...obj].map(c=>c===c.toUpperCase()?c.toLowerCase():c.toUpperCase()).join('');},
+        strip:a=>strip(a,'b'),lstrip:a=>strip(a,'l'),rstrip:a=>strip(a,'r'),
+        replace:a=>{
+          argc(a,2,2);needStr(a[0]);needStr(a[1]);
           return obj.split(a[0]).join(a[1]);
         },
-        count:(a)=>{
-          if(a.length!==1||typeof a[0]!=='string')throw new PyError('TypeError','count() takes one string argument',line);
+        count:a=>{
+          argc(a,1,1);needStr(a[0]);
           if(a[0]==='')return new PyNum(obj.length+1,false);
           return new PyNum(obj.split(a[0]).length-1,false);
         },
-        split:(a)=>{
-          if(a.length===0)return obj.trim().split(/\s+/).filter(s=>s!=='');
-          return obj.split(a[0]);
+        find:a=>{argc(a,1,1);return new PyNum(obj.indexOf(needStr(a[0])),false);},
+        index:a=>{argc(a,1,1);const i=obj.indexOf(needStr(a[0]));
+          if(i<0)throw new PyError('ValueError','substring not found',line);return new PyNum(i,false);},
+        startswith:a=>{argc(a,1,1);return obj.startsWith(needStr(a[0]));},
+        endswith:a=>{argc(a,1,1);return obj.endsWith(needStr(a[0]));},
+        isdigit:a=>{argc(a,0,0);return /^[0-9]+$/.test(obj);},
+        isnumeric:a=>{argc(a,0,0);return /^[0-9]+$/.test(obj);},
+        isalpha:a=>{argc(a,0,0);return /^[A-Za-zÀ-ɏ]+$/.test(obj);},
+        isalnum:a=>{argc(a,0,0);return /^[A-Za-z0-9À-ɏ]+$/.test(obj);},
+        isupper:a=>{argc(a,0,0);return /[A-Z]/.test(obj)&&obj===obj.toUpperCase();},
+        islower:a=>{argc(a,0,0);return /[a-z]/.test(obj)&&obj===obj.toLowerCase();},
+        isspace:a=>{argc(a,0,0);return /^\s+$/.test(obj);},
+        split:a=>{
+          argc(a,0,2);
+          const sep=a.length&&a[0]!==PyNone?needStr(a[0]):null;
+          const max=a.length>1?toInt(a[1],line,'split()'):-1;
+          if(sep==='')throw new PyError('ValueError','empty separator',line);
+          let parts;
+          if(sep===null){
+            parts=obj.trim().split(/\s+/).filter(s=>s!=='');
+            if(max>=0&&parts.length>max+1){
+              let rest=obj.trim();const out=[];
+              for(let i=0;i<max;i++){const mm=rest.match(/^(\S+)\s+/);out.push(mm[1]);rest=rest.slice(mm[0].length);}
+              out.push(rest);parts=out;
+            }
+          } else {
+            parts=obj.split(sep);
+            if(max>=0&&parts.length>max+1)parts=parts.slice(0,max).concat([parts.slice(max).join(sep)]);
+          }
+          return parts;
+        },
+        join:a=>{
+          argc(a,1,1);
+          const items=self.iterate(a[0],line);
+          items.forEach((x,i)=>{if(typeof x!=='string')throw new PyError('TypeError',`join() needs strings, but item ${i} is ${typeName(x)} — convert it with str() first`,line);});
+          return items.join(obj);
+        },
+        center:a=>pad(a,'c'),ljust:a=>pad(a,'l'),rjust:a=>pad(a,'r'),
+        zfill:a=>{argc(a,1,1);const w=toInt(a[0],line,'zfill()');
+          const sg=/^[+-]/.test(obj)?obj[0]:'';const body=sg?obj.slice(1):obj;
+          return sg+body.padStart(Math.max(0,w-sg.length),'0');},
+        format:(a,kw)=>{
+          let auto=0;
+          return obj.replace(/\{\{|\}\}|\{([^{}]*)\}/g,(whole,inner)=>{
+            if(whole==='{{')return '{';if(whole==='}}')return '}';
+            let [key,spec]=splitSpec(inner);
+            let v;
+            if(key==='')v=a[auto++];
+            else if(/^\d+$/.test(key))v=a[+key];
+            else v=kw[key];
+            if(v===undefined)throw new PyError('IndexError','format() has more {} fields than values',line);
+            return formatValue(v,spec||'',line);
+          });
         },
       }[name];
-      if(m)return {pynative:true,name,call:(args)=>{
-        if(['upper','lower','title','strip'].includes(name)&&args.length)
-          throw new PyError('TypeError',`${name}() takes no arguments`,line);
-        return m(args);
-      }};
-      // allow zero-arg forms called immediately
+      if(m)return m;
     }
-    throw new PyError('AttributeError',`'${typeName(obj)}' object has no attribute '${name}'`,line);
+    return null;
   }
-  callFn(fn,args,line){
-    if(fn&&fn.pynative)return fn.call(args);
-    if(fn&&fn.pybuiltin)return fn.call(this,args,line);
-    if(fn&&fn.pyfunc){
-      if(args.length!==fn.params.length)
-        throw new PyError('TypeError',`${fn.name}() takes ${fn.params.length} argument${fn.params.length===1?'':'s'} but ${args.length} ${args.length===1?'was':'were'} given`,line);
-      const local={vars:Object.create(null),parent:fn.defEnv};
-      fn.params.forEach((p,i)=>local.vars[p]=args[i]);
-      try{this.execBlock(fn.body,local);}
-      catch(e){
-        if(e instanceof ReturnSig)return e.v;
-        throw e;
+  sortList(items,kw,line){
+    const key=kw.key&&kw.key!==PyNone?kw.key:null;
+    const rev=kw.reverse!==undefined&&truthy(kw.reverse);
+    const decorated=items.map((v,i)=>({v,k:key?this.callFn(key,[v],{},line):v,i}));
+    decorated.sort((x,y)=>{
+      const c=pyCmp(x.k,y.k,line,'<');
+      return rev?-c:c;
+    });
+    return decorated.map(d=>d.v);
+  }
+  callFn(fn,args,kw,line){
+    kw=kw||{};
+    if(fn&&fn.pynative){
+      if(Object.keys(kw).length&&fn.name!=='sort'&&fn.name!=='format')
+        throw new PyError('TypeError',`${fn.name}() takes no keyword arguments`,line);
+      return fn.call(args,kw);
+    }
+    if(fn&&fn.pybuiltin){
+      if(Object.keys(kw).length&&!fn.kw)
+        throw new PyError('TypeError',`${fn.name||'this function'}() takes no keyword arguments`,line);
+      if(fn.kw)for(const k in kw)if(!fn.kw.includes(k))
+        throw new PyError('TypeError',`'${k}' is an invalid keyword argument for ${fn.name}()`,line);
+      return fn.call(this,args,line,kw);
+    }
+    if(fn&&fn.pybound)return this.callUser(fn.fn,[fn.self,...args],kw,line);
+    if(fn&&fn.pyfunc)return this.callUser(fn,args,kw,line);
+    if(fn&&fn.pyclass){
+      const inst={pyinst:true,cls:fn,attrs:Object.create(null)};
+      const init=classLookup(fn,'__init__');
+      if(init&&init.pyfunc){
+        const r=this.callUser(init,[inst,...args],kw,line);
+        if(r!==PyNone)throw new PyError('TypeError','__init__() should return None — it sets things up, it doesn\'t return them',line);
       }
-      return PyNone;
+      else if(args.length||Object.keys(kw).length)
+        throw new PyError('TypeError',`${fn.name}() takes no arguments — did you forget to write __init__?`,line);
+      return inst;
     }
     throw new PyError('TypeError',`'${typeName(fn)}' object is not callable`,line);
   }
+  callUser(fn,args,kw,line){
+    const n=fn.params.length;
+    const isMethod=fn.params[0]==='self';
+    const shown=k=>isMethod?k-1:k;
+    if(args.length>n)
+      throw new PyError('TypeError',`${fn.name}() takes ${shown(n)} argument${shown(n)===1?'':'s'} but ${shown(args.length)} ${shown(args.length)===1?'was':'were'} given`,line);
+    const local={vars:Object.create(null),parent:fn.defEnv};
+    args.forEach((a,i)=>local.vars[fn.params[i]]=a);
+    for(const k in kw){
+      if(!fn.params.includes(k))throw new PyError('TypeError',`${fn.name}() got an unexpected keyword argument '${k}'`,line);
+      if(k in local.vars)throw new PyError('TypeError',`${fn.name}() got multiple values for argument '${k}'`,line);
+      local.vars[k]=kw[k];
+    }
+    const missing=[];
+    fn.params.forEach((p,i)=>{
+      if(!(p in local.vars)){
+        if(fn.defaults[i]!==undefined)local.vars[p]=fn.defaults[i];
+        else missing.push(`'${p}'`);
+      }
+    });
+    if(missing.length)
+      throw new PyError('TypeError',`${fn.name}() missing ${missing.length} required argument${missing.length===1?'':'s'}: ${missing.join(' and ')}`,line);
+    if(this.depth>=400)
+      throw new PyError('RecursionError','maximum recursion depth exceeded — does your recursive function have a base case?',line);
+    this.depth++;
+    try{this.execBlock(fn.body,local);}
+    catch(e){
+      if(e instanceof ReturnSig)return e.v;
+      if(e instanceof BreakSig||e instanceof ContinueSig)
+        throw new PyError('SyntaxError',"'break' and 'continue' only work inside a loop",line);
+      throw e;
+    }
+    finally{this.depth--;}
+    return PyNone;
+  }
 }
 
+function minmax(which){
+  return {pybuiltin:true,name:which,kw:['key','default'],call(interp,args,line,kw){
+    let vals;
+    if(args.length===1)vals=interp.iterate(args[0],line);
+    else vals=args;
+    if(!vals.length){
+      if(kw.default!==undefined)return kw.default;
+      throw new PyError('ValueError',`${which}() arg is an empty sequence`,line);
+    }
+    const key=kw.key&&kw.key!==PyNone?kw.key:null;
+    let best=vals[0],bk=key?interp.callFn(key,[best],{},line):best;
+    for(let i=1;i<vals.length;i++){
+      const k=key?interp.callFn(key,[vals[i]],{},line):vals[i];
+      const c=pyCmp(k,bk,line,which==='min'?'<':'>');
+      if(which==='min'?c<0:c>0){best=vals[i];bk=k;}
+    }
+    return best;
+  }};
+}
+function excCtor(kind){
+  return {pybuiltin:true,name:kind,excKind:kind,call(interp,args){
+    return makeExc(kind,args.length?pyStr(args[0]):'');
+  }};
+}
+const TYPE_CHECKS={
+  int:v=>(isNum(v)&&!v.isFloat)||typeof v==='boolean',float:v=>isNum(v)&&v.isFloat,str:v=>typeof v==='string',
+  bool:v=>typeof v==='boolean',list:v=>Array.isArray(v),tuple:v=>v instanceof PyTuple,dict:v=>v instanceof PyDict,
+};
+
 const BUILTIN_NAMES={
-  print:{pybuiltin:true,call(interp,args){
-    interp.emit(args.map(pyStr).join(' '));
-    interp.endline();
+  print:{pybuiltin:true,name:'print',kw:['sep','end'],call(interp,args,line,kw){
+    const sep=kw.sep===undefined||kw.sep===PyNone?' ':kw.sep;
+    const end=kw.end===undefined||kw.end===PyNone?'\n':kw.end;
+    if(typeof sep!=='string'||typeof end!=='string')throw new PyError('TypeError','sep and end must be strings',line);
+    interp.emit(args.map(pyStr).join(sep)+end);
     return PyNone;
   }},
-  range:{pybuiltin:true,call(interp,args,line){
+  range:{pybuiltin:true,name:'range',call(interp,args,line){
     let start=0,stop,step=1;
-    const iv=(a,what)=>{
+    const iv=a=>{
       const n=toNum(a,line,'range()');
       if(n.isFloat)throw new PyError('TypeError',`'float' object cannot be interpreted as an integer — range() needs whole numbers`,line);
       return n.v;
@@ -988,88 +1811,154 @@ const BUILTIN_NAMES={
     const items=[];
     if(step>0)for(let i=start;i<stop;i+=step){items.push(new PyNum(i,false));if(items.length>100000)throw new PyError('RuntimeError','range too large',line);}
     else for(let i=start;i>stop;i+=step){items.push(new PyNum(i,false));if(items.length>100000)throw new PyError('RuntimeError','range too large',line);}
-    return {pyrange:true,items};
+    return {pyrange:true,items,start,stop,step};
   }},
-  len:{pybuiltin:true,call(interp,args,line){
+  len:{pybuiltin:true,name:'len',call(interp,args,line){
+    if(args.length!==1)throw new PyError('TypeError',`len() takes exactly one argument (${args.length} given)`,line);
     const v=args[0];
-    if(typeof v==='string')return new PyNum(v.length,false);
-    if(Array.isArray(v))return new PyNum(v.length,false);
-    if(v&&v.pyrange)return new PyNum(v.items.length,false);
+    const n=seqLen(v);
+    if(n!==null)return new PyNum(n,false);
+    if(v&&v.pyinst){
+      const f=classLookup(v.cls,'__len__');
+      if(f&&f.pyfunc)return interp.callUser(f,[v],{},line);
+    }
     throw new PyError('TypeError',`object of type '${typeName(v)}' has no len()`,line);
   }},
-  str:{pybuiltin:true,call(interp,args){return args.length?pyStr(args[0]):'';}},
-  int:{pybuiltin:true,call(interp,args,line){
+  str:{pybuiltin:true,name:'str',call(interp,args){return args.length?pyStr(args[0]):'';}},
+  repr:{pybuiltin:true,name:'repr',call(interp,args){return pyRepr(args[0]);}},
+  int:{pybuiltin:true,name:'int',call(interp,args,line){
+    if(!args.length)return new PyNum(0,false);
     const v=args[0];
     if(isNum(v))return new PyNum(Math.trunc(v.v),false);
     if(typeof v==='boolean')return new PyNum(v?1:0,false);
     if(typeof v==='string'){
-      const t=v.trim();
-      if(!/^[+-]?\d+$/.test(t))throw new PyError('ValueError',`invalid literal for int(): '${v}'`,line);
+      const t=v.trim().replace(/_/g,'');
+      if(!/^[+-]?\d+$/.test(t))throw new PyError('ValueError',`invalid literal for int() with base 10: ${strRepr(v)}`,line);
       return new PyNum(parseInt(t,10),false);
     }
     throw new PyError('TypeError',`int() can't convert ${typeName(v)}`,line);
   }},
-  float:{pybuiltin:true,call(interp,args,line){
+  float:{pybuiltin:true,name:'float',call(interp,args,line){
+    if(!args.length)return new PyNum(0,true);
     const v=args[0];
     if(isNum(v))return new PyNum(v.v,true);
+    if(typeof v==='boolean')return new PyNum(v?1:0,true);
     if(typeof v==='string'){
-      const n=parseFloat(v.trim());
-      if(isNaN(n))throw new PyError('ValueError',`could not convert string to float: '${v}'`,line);
-      return new PyNum(n,true);
+      const t=v.trim().toLowerCase();
+      if(t==='inf'||t==='infinity')return new PyNum(Infinity,true);
+      if(t==='-inf')return new PyNum(-Infinity,true);
+      if(!/^[+-]?(\d+\.?\d*|\.\d+)(e[+-]?\d+)?$/.test(t))throw new PyError('ValueError',`could not convert string to float: ${strRepr(v)}`,line);
+      return new PyNum(parseFloat(t),true);
     }
     throw new PyError('TypeError',`float() can't convert ${typeName(v)}`,line);
   }},
-  abs:{pybuiltin:true,call(interp,args,line){
+  bool:{pybuiltin:true,name:'bool',call(interp,args){return args.length?truthy(args[0]):false;}},
+  list:{pybuiltin:true,name:'list',call(interp,args,line){return args.length?interp.iterate(args[0],line):[];}},
+  tuple:{pybuiltin:true,name:'tuple',call(interp,args,line){return new PyTuple(args.length?interp.iterate(args[0],line):[]);}},
+  dict:{pybuiltin:true,name:'dict',kw:null,call(interp,args,line,kw){
+    const d=new PyDict();
+    if(args.length){
+      if(args[0] instanceof PyDict)for(const [k,v] of args[0].entries())d.set(k,v);
+      else for(const pair of interp.iterate(args[0],line)){
+        const kv=interp.iterate(pair,line);
+        if(kv.length!==2)throw new PyError('ValueError','dict() needs pairs of (key, value)',line);
+        interp.withLine(line,()=>d.set(kv[0],kv[1]));
+      }
+    }
+    for(const k in kw)d.set(k,kw[k]);
+    return d;
+  }},
+  abs:{pybuiltin:true,name:'abs',call(interp,args,line){
     const n=toNum(args[0],line,'abs()');
     return new PyNum(Math.abs(n.v),n.isFloat);
   }},
-  round:{pybuiltin:true,call(interp,args,line){
+  round:{pybuiltin:true,name:'round',call(interp,args,line){
     const n=toNum(args[0],line,'round()');
-    if(args.length>1){
-      const d=toNum(args[1],line,'round()').v;
-      const f=Math.pow(10,d);
-      return new PyNum(Math.round(n.v*f)/f,true);
+    const half=x=>{const r=Math.round(x);return (Math.abs(x%1)===0.5)?2*Math.round(x/2):r;};
+    if(args.length>1&&args[1]!==PyNone){
+      const d=toInt(args[1],line,'round()');
+      if(d<0){const f=Math.pow(10,-d);return new PyNum(half(n.v/f)*f,n.isFloat);}
+      const r=Math.sign(n.v)*Number(toFixedPy(Math.abs(n.v),Math.min(d,20)));
+      return new PyNum(r,n.isFloat);
     }
-    return new PyNum(Math.round(n.v),false);
+    return new PyNum(half(n.v),false);
   }},
-  min:{pybuiltin:true,call(interp,args,line){
-    const vals=(args.length===1&&Array.isArray(args[0]))?args[0]:args;
-    if(!vals.length)throw new PyError('ValueError','min() arg is an empty sequence',line);
-    return vals.reduce((a,b)=>toNum(b,line,'min()').v<toNum(a,line,'min()').v?b:a);
-  }},
-  max:{pybuiltin:true,call(interp,args,line){
-    const vals=(args.length===1&&Array.isArray(args[0]))?args[0]:args;
-    if(!vals.length)throw new PyError('ValueError','max() arg is an empty sequence',line);
-    return vals.reduce((a,b)=>toNum(b,line,'max()').v>toNum(a,line,'max()').v?b:a);
-  }},
-  sum:{pybuiltin:true,call(interp,args,line){
-    const v=args[0];
-    const items=Array.isArray(v)?v:(v&&v.pyrange?v.items:null);
-    if(!items)throw new PyError('TypeError',`sum() needs a list or range, got ${typeName(v)}`,line);
-    let total=new PyNum(0,false);
-    for(const x of items){
+  min:minmax('min'),
+  max:minmax('max'),
+  sum:{pybuiltin:true,name:'sum',call(interp,args,line){
+    if(!args.length)throw new PyError('TypeError','sum() needs a list of numbers',line);
+    let total=args.length>1?toNum(args[1],line,'sum()'):new PyNum(0,false);
+    for(const x of interp.iterate(args[0],line)){
       const n=toNum(x,line,'sum()');
       total=new PyNum(total.v+n.v,total.isFloat||n.isFloat);
     }
     return total;
   }},
-  input:{pybuiltin:true,call(interp,args,line){
+  sorted:{pybuiltin:true,name:'sorted',kw:['key','reverse'],call(interp,args,line,kw){
+    if(args.length!==1)throw new PyError('TypeError','sorted() takes one list (plus key= and reverse=)',line);
+    return interp.sortList(interp.iterate(args[0],line),kw,line);
+  }},
+  reversed:{pybuiltin:true,name:'reversed',call(interp,args,line){return interp.iterate(args[0],line).reverse();}},
+  enumerate:{pybuiltin:true,name:'enumerate',kw:['start'],call(interp,args,line,kw){
+    let i=kw.start!==undefined?toInt(kw.start,line,'enumerate()'):(args.length>1?toInt(args[1],line,'enumerate()'):0);
+    return interp.iterate(args[0],line).map(v=>new PyTuple([new PyNum(i++,false),v]));
+  }},
+  zip:{pybuiltin:true,name:'zip',call(interp,args,line){
+    const seqs=args.map(a=>interp.iterate(a,line));
+    const n=seqs.length?Math.min(...seqs.map(s=>s.length)):0;
+    const out=[];for(let i=0;i<n;i++)out.push(new PyTuple(seqs.map(s=>s[i])));
+    return out;
+  }},
+  any:{pybuiltin:true,name:'any',call(interp,args,line){return interp.iterate(args[0],line).some(truthy);}},
+  all:{pybuiltin:true,name:'all',call(interp,args,line){return interp.iterate(args[0],line).every(truthy);}},
+  ord:{pybuiltin:true,name:'ord',call(interp,args,line){
+    const s=args[0];
+    if(typeof s!=='string'||[...s].length!==1)throw new PyError('TypeError','ord() expected a single character',line);
+    return new PyNum(s.codePointAt(0),false);
+  }},
+  chr:{pybuiltin:true,name:'chr',call(interp,args,line){return String.fromCodePoint(toInt(args[0],line,'chr()'));}},
+  divmod:{pybuiltin:true,name:'divmod',call(interp,args,line){
+    return new PyTuple([interp.binop('//',args[0],args[1],line),interp.binop('%',args[0],args[1],line)]);
+  }},
+  pow:{pybuiltin:true,name:'pow',call(interp,args,line){return interp.binop('**',args[0],args[1],line);}},
+  format:{pybuiltin:true,name:'format',call(interp,args,line){return formatValue(args[0],args.length>1?args[1]:'',line);}},
+  isinstance:{pybuiltin:true,name:'isinstance',call(interp,args,line){
+    const [v,t]=args;
+    const check=t=>{
+      if(t&&t.pyclass){if(!v||!v.pyinst)return false;for(let c=v.cls;c;c=c.base)if(c===t)return true;return false;}
+      for(const name in TYPE_CHECKS)if(BUILTIN_NAMES[name]===t)return TYPE_CHECKS[name](v);
+      throw new PyError('TypeError','isinstance() needs a type like int, str, list or a class as its second argument',line);
+    };
+    return t instanceof PyTuple?t.items.some(check):check(t);
+  }},
+  input:{pybuiltin:true,name:'input',call(interp,args,line){
     throw new PyError('RuntimeError',"input() isn't available on the island — assign a value to a variable instead",line);
   }},
-  type:{pybuiltin:true,call(interp,args){
-    return `<class '${typeName(args[0])}'>`;
+  type:{pybuiltin:true,name:'type',call(interp,args){
+    const v=args[0];
+    if(v&&v.pyinst)return v.cls;
+    return `<class '${typeName(v)}'>`;
   }},
 };
+for(const k of ['Exception','ValueError','TypeError','ZeroDivisionError','IndexError','KeyError',
+  'NameError','AttributeError','RuntimeError','ArithmeticError','LookupError','RecursionError'])
+  BUILTIN_NAMES[k]=excCtor(k);
 
 function runPython(src){
   const interp=new Interp();
+  const done=error=>({out:interp.out,error});
   try{
     interp.run(src);
-    return {out:interp.out,error:null};
+    return done(null);
   }catch(e){
-    if(e instanceof PyError)
-      return {out:interp.out,error:`${e.kind}: ${e.message}`+(e.pyline?` (line ${e.pyline})`:'')};
-    return {out:interp.out,error:'InternalError: '+e.message};
+    if(e instanceof PyError){
+      const ln=e.pyline||interp.line;
+      return done(`${e.kind}: ${e.message}`+(ln?` (line ${ln})`:''));
+    }
+    if(e instanceof BreakSig||e instanceof ContinueSig)return done("SyntaxError: 'break' and 'continue' only work inside a loop");
+    if(e instanceof ReturnSig)return done("SyntaxError: 'return' only works inside a function");
+    if(e instanceof RangeError)return done('RecursionError: maximum recursion depth exceeded — does your recursive function have a base case?');
+    return done('InternalError: '+e.message);
   }
 }
 
@@ -1079,7 +1968,11 @@ function runPython(src){
 const CHAPTERS=[
   'I · Landfall','II · Naming Things','III · Forks in the Trail',
   'IV · The Loop Lagoon',"V · The Toolmaker's Ridge",
-  'VI · The Echoing Caves','VII · The While Wilds','VIII · The Deep Jungle'
+  'VI · The Echoing Caves','VII · The While Wilds','VIII · The Deep Jungle',
+  'IX · The Ruined Archive',"X · The Merchant's Ledger",'XI · The Twin Rivers',
+  'XII · The Sorting Stones','XIII · The Foundry',"XIV · The Weaver's Loom",
+  'XV · The Storm Coast','XVI · The Guild of Makers',"XVII · The Cartographer's Table",
+  "XVIII · The Serpent's Crown"
 ];
 
 const LEVELS=[
@@ -1445,13 +2338,572 @@ total: 41</code></pre>`,
          'Each line is one print, e.g. print(f"peak: {max(trek)}").'],
   solution:'trek = [12, 7, 19, 3]\nprint(f"peak: {max(trek)}")\nprint(f"valley: {min(trek)}")\nprint(f"total: {sum(trek)}")'
 },
+// ---- Chapter IX ----
+{
+  id:'9-1',ch:8,xp:30,title:'The torn map',
+  brief:`<p>Past the jungle lies a ruined archive, and its best map is torn in two. You already know <code>word[0]</code> plucks one character. A <strong>slice</strong> plucks a whole run: <code>word[start:stop]</code> takes from <code>start</code> up to — but not including — <code>stop</code>. Leave a side blank to mean "from the beginning" or "to the end", and add a third number for the step:</p>
+<pre><code>word = "LAGOON"
+print(word[0:3])    # LAG
+print(word[3:])     # OON
+print(word[::-1])   # NOOGAL  (step -1 walks backwards)</code></pre>`,
+  goal:`Print the first 7 letters of <code>scroll</code>, then everything from position 7 on, then the whole scroll reversed. Expected output:
+<pre><code>SERPENT
+ISLES
+SELSITNEPRES</code></pre>`,
+  starter:'scroll = "SERPENTISLES"\n# Three slices...\n',
+  expected:'SERPENT\nISLES\nSELSITNEPRES',
+  require:[{re:/\[\s*0?\s*:\s*7\s*\]/,msg:'Take the first seven letters with a slice: scroll[:7]'},
+           {re:/\[\s*7\s*:\s*\]/,msg:'Take the rest with scroll[7:] — a blank stop means "to the end".'},
+           {re:/\[\s*:\s*:\s*-\s*1\s*\]/,msg:'Reverse it with a step of -1: scroll[::-1]'}],
+  hints:['The stop number is never included, so scroll[:7] gives positions 0 to 6 — exactly 7 letters.',
+         'print(scroll[:7]), print(scroll[7:]), print(scroll[::-1]).'],
+  solution:'scroll = "SERPENTISLES"\nprint(scroll[:7])\nprint(scroll[7:])\nprint(scroll[::-1])'
+},
+{
+  id:'9-2',ch:8,xp:30,title:'Mending the crew roster',
+  brief:`<p>The archive's crew roster is out of date. Unlike strings, lists can be changed in place. Assign to a position to replace an item, <code>.insert(position, item)</code> to squeeze one in, and <code>.remove(item)</code> to take one out by value:</p>
+<pre><code>boats = ["raft", "skiff"]
+boats[0] = "canoe"        # ['canoe', 'skiff']
+boats.insert(1, "barge")  # ['canoe', 'barge', 'skiff']
+boats.remove("skiff")     # ['canoe', 'barge']</code></pre>`,
+  goal:`Bram has retired: replace him (position 1) with <code>"Dev"</code>. Then insert <code>"Zia"</code> at the very front, remove <code>"Cleo"</code>, and print the roster. Expected output: <code>['Zia', 'Ada', 'Dev']</code>`,
+  starter:'crew = ["Ada", "Bram", "Cleo"]\n# Replace, insert, remove, then print\n',
+  expected:"['Zia', 'Ada', 'Dev']",
+  require:[{re:/crew\s*\[\s*1\s*\]\s*=[^=]/,msg:'Replace Bram by assigning to his position: crew[1] = "Dev"'},
+           {re:/\.insert\s*\(/,msg:'Add Zia with crew.insert(0, "Zia").'},
+           {re:/\.remove\s*\(/,msg:'Take Cleo out with crew.remove("Cleo").'}],
+  hints:['Do the replacement first — once Zia is inserted at the front, everyone shifts one place to the right.',
+         'crew[1] = "Dev", then crew.insert(0, "Zia"), then crew.remove("Cleo"), then print(crew).'],
+  solution:'crew = ["Ada", "Bram", "Cleo"]\ncrew[1] = "Dev"\ncrew.insert(0, "Zia")\ncrew.remove("Cleo")\nprint(crew)'
+},
+{
+  id:'9-3',ch:8,xp:30,title:'The archivist’s index',
+  brief:`<p>Every scroll in the archive is indexed by its words. <code>.split()</code> chops a string into a list of words, and <code>"-".join(words)</code> glues a list back into one string with <code>-</code> between the pieces. To ask whether something is <em>missing</em>, flip <code>in</code> into <code>not in</code>:</p>
+<pre><code>parts = "salt and rope".split()   # ['salt', 'and', 'rope']
+print("rope" in parts)            # True
+print("lamp" not in parts)        # True
+print("+".join(parts))            # salt+and+rope</code></pre>`,
+  goal:`Split <code>line</code> into words, then print: how many words there are, whether <code>"gate"</code> is among them, whether <code>"boat"</code> is <em>not</em> among them, and the words joined with dashes. Expected output:
+<pre><code>6
+True
+True
+the-river-hides-the-eastern-gate</code></pre>`,
+  starter:'line = "the river hides the eastern gate"\nwords = line.split()\n# Four lines of report\n',
+  expected:'6\nTrue\nTrue\nthe-river-hides-the-eastern-gate',
+  require:[{re:/\.split\s*\(/,msg:'Break the line into words with .split().'},
+           {re:/not\s+in/,msg:'Check for the missing word with not in.'},
+           {re:/\.join\s*\(/,msg:'Glue the words back together with "-".join(words).'}],
+  hints:['len(words) counts the list items; "gate" in words checks membership.',
+         'The joiner goes in front of .join: print("-".join(words)).'],
+  solution:'line = "the river hides the eastern gate"\nwords = line.split()\nprint(len(words))\nprint("gate" in words)\nprint("boat" not in words)\nprint("-".join(words))'
+},
+// ---- Chapter X ----
+{
+  id:'10-1',ch:9,xp:32,title:'The price board',
+  brief:`<p>You reach a trading post. Its price board is a <strong>dictionary</strong>: a collection of <em>key → value</em> pairs in curly braces. Look a value up by its key in square brackets; assign to a key to add it or change it:</p>
+<pre><code>ages = {"Ada": 31, "Bram": 27}
+print(ages["Ada"])   # 31
+ages["Cleo"] = 40     # adds a new pair
+ages["Ada"] = 32      # changes an existing one</code></pre>`,
+  goal:`Add <code>"salt"</code> to the board at price <code>3</code>, raise the lamp's price to <code>15</code>, then print the lamp's price and the whole board. Expected output:
+<pre><code>15
+{'rope': 5, 'lamp': 15, 'salt': 3}</code></pre>`,
+  starter:'prices = {"rope": 5, "lamp": 12}\n# Update the board, then report\n',
+  expected:"15\n{'rope': 5, 'lamp': 15, 'salt': 3}",
+  require:[{re:/prices\s*\[\s*["']salt["']\s*\]\s*=[^=]/,msg:'Add salt by assigning to its key: prices["salt"] = 3'},
+           {re:/prices\s*\[\s*["']lamp["']\s*\]\s*=[^=]/,msg:'Change the lamp price by assigning to prices["lamp"].'}],
+  hints:['prices["salt"] = 3 adds a pair; prices["lamp"] = 15 replaces the old 12.',
+         'Then print(prices["lamp"]) and print(prices). New keys appear at the end.'],
+  solution:'prices = {"rope": 5, "lamp": 12}\nprices["salt"] = 3\nprices["lamp"] = 15\nprint(prices["lamp"])\nprint(prices)'
+},
+{
+  id:'10-2',ch:9,xp:32,title:'Reading the ledger',
+  brief:`<p>The merchant wants the stock read aloud. Looping over <code>stock.items()</code> hands you each pair as a key and a value at once — give the loop two names, separated by a comma:</p>
+<pre><code>for name, age in ages.items():
+    print(name, "is", age)</code></pre>`,
+  goal:`Print each item as <code>name: count</code> — but when the count is 0, print <code>name: SOLD OUT</code> instead. Expected output:
+<pre><code>rope: 3
+lamp: SOLD OUT
+salt: 7</code></pre>`,
+  starter:'stock = {"rope": 3, "lamp": 0, "salt": 7}\n# Read every line of the ledger\n',
+  expected:'rope: 3\nlamp: SOLD OUT\nsalt: 7',
+  require:[{re:/\.items\s*\(\s*\)/,msg:'Loop over stock.items() to get keys and values together.'},
+           {re:/for\s+\w+\s*,\s*\w+\s+in/,msg:'Give the loop two names: for item, count in stock.items():'}],
+  hints:['for item, count in stock.items(): — then an if count == 0: inside the loop.',
+         'Use f-strings: print(f"{item}: SOLD OUT") and, in the else, print(f"{item}: {count}").'],
+  solution:'stock = {"rope": 3, "lamp": 0, "salt": 7}\nfor item, count in stock.items():\n    if count == 0:\n        print(f"{item}: SOLD OUT")\n    else:\n        print(f"{item}: {count}")'
+},
+{
+  id:'10-3',ch:9,xp:32,title:'The bird census',
+  brief:`<p>The trading post pays for a bird census. Counting things is the dictionary's favourite job. The trick is <code>.get(key, 0)</code>: it returns the current count, or 0 if the key isn't there yet — so you never crash on a bird you haven't seen before:</p>
+<pre><code>tally = {}
+tally["owl"] = tally.get("owl", 0) + 1   # {'owl': 1}
+tally["owl"] = tally.get("owl", 0) + 1   # {'owl': 2}</code></pre>`,
+  goal:`Loop over <code>sightings</code> and count each bird into <code>counts</code>, then print it. Expected output: <code>{'parrot': 3, 'heron': 2, 'ibis': 1}</code>`,
+  starter:'sightings = ["parrot", "heron", "parrot", "ibis", "heron", "parrot"]\ncounts = {}\n# Tally each bird\n',
+  expected:"{'parrot': 3, 'heron': 2, 'ibis': 1}",
+  require:[{re:/\bfor\b/,msg:'Loop over the sightings.'},
+           {re:/\.get\s*\(/,msg:'Use counts.get(bird, 0) so new birds start at zero.'}],
+  hints:['for bird in sightings: — and inside, update counts[bird].',
+         'counts[bird] = counts.get(bird, 0) + 1, then print(counts) after the loop.'],
+  solution:'sightings = ["parrot", "heron", "parrot", "ibis", "heron", "parrot"]\ncounts = {}\nfor bird in sightings:\n    counts[bird] = counts.get(bird, 0) + 1\nprint(counts)'
+},
+// ---- Chapter XI ----
+{
+  id:'11-1',ch:10,xp:34,title:'Fixed coordinates',
+  brief:`<p>Two rivers split the valley, and your camp's coordinates are carved in stone. A <strong>tuple</strong> is like a list in round brackets — but it can never be changed. You can <em>unpack</em> one into separate variables, and the same trick swaps two variables in one line:</p>
+<pre><code>point = (3, 9)
+a, b = point     # a is 3, b is 9
+a, b = b, a      # now a is 9, b is 3</code></pre>`,
+  goal:`Unpack <code>camp</code> into <code>x</code> and <code>y</code> and print them; then swap them in one line and print again. Expected output:
+<pre><code>x=12 y=48
+x=48 y=12</code></pre>`,
+  starter:'camp = (12, 48)\n# Unpack, report, swap, report\n',
+  expected:'x=12 y=48\nx=48 y=12',
+  require:[{re:/x\s*,\s*y\s*=\s*camp/,msg:'Unpack the tuple: x, y = camp'},
+           {re:/x\s*,\s*y\s*=\s*y\s*,\s*x/,msg:'Swap in one line: x, y = y, x'}],
+  hints:['x, y = camp puts 12 in x and 48 in y.',
+         'Print with print(f"x={x} y={y}") before and after x, y = y, x.'],
+  solution:'camp = (12, 48)\nx, y = camp\nprint(f"x={x} y={y}")\nx, y = y, x\nprint(f"x={x} y={y}")'
+},
+{
+  id:'11-2',ch:10,xp:34,title:'Numbering the canoes',
+  brief:`<p>Each canoe needs a number painted on its bow. <code>enumerate()</code> walks a list and hands you a counter alongside each item. It counts from 0 unless you tell it otherwise with <code>start=</code>:</p>
+<pre><code>for i, tool in enumerate(["axe", "saw"], start=1):
+    print(i, tool)    # 1 axe, then 2 saw</code></pre>`,
+  goal:`Print the canoes as a numbered list starting at 1. Expected output:
+<pre><code>1. Heron
+2. Otter
+3. Kingfisher</code></pre>`,
+  starter:'canoes = ["Heron", "Otter", "Kingfisher"]\n# Number them from 1\n',
+  expected:'1. Heron\n2. Otter\n3. Kingfisher',
+  require:[{re:/enumerate\s*\(/,msg:'Let enumerate() do the counting.'}],
+  hints:['for i, name in enumerate(canoes, start=1):',
+         'Inside the loop: print(f"{i}. {name}") — mind the dot and the space.'],
+  solution:'canoes = ["Heron", "Otter", "Kingfisher"]\nfor i, name in enumerate(canoes, start=1):\n    print(f"{i}. {name}")'
+},
+{
+  id:'11-3',ch:10,xp:34,title:'Where the rivers meet',
+  brief:`<p>Two lists that line up — rowers and their stroke counts — meet like two rivers. <code>zip()</code> walks them side by side, handing you one item from each per pass:</p>
+<pre><code>for name, age in zip(["Ada", "Bram"], [31, 27]):
+    print(name, age)   # Ada 31, then Bram 27</code></pre>`,
+  goal:`Print one line per rower, then the total number of strokes. Expected output:
+<pre><code>Ada rowed 120 strokes
+Bram rowed 95 strokes
+Cleo rowed 140 strokes
+Total: 355</code></pre>`,
+  starter:'rowers = ["Ada", "Bram", "Cleo"]\nstrokes = [120, 95, 140]\n# Pair them up\n',
+  expected:'Ada rowed 120 strokes\nBram rowed 95 strokes\nCleo rowed 140 strokes\nTotal: 355',
+  require:[{re:/zip\s*\(/,msg:'Walk both lists together with zip(rowers, strokes).'}],
+  hints:['for name, count in zip(rowers, strokes): then print(f"{name} rowed {count} strokes").',
+         'After the loop, unindented: print(f"Total: {sum(strokes)}").'],
+  solution:'rowers = ["Ada", "Bram", "Cleo"]\nstrokes = [120, 95, 140]\nfor name, count in zip(rowers, strokes):\n    print(f"{name} rowed {count} strokes")\nprint(f"Total: {sum(strokes)}")'
+},
+// ---- Chapter XII ----
+{
+  id:'12-1',ch:11,xp:36,title:'Stones in a row',
+  brief:`<p>The Sorting Stones must be laid out by weight. <code>sorted(items)</code> returns a <em>new</em> sorted list and leaves the original alone. Add <code>reverse=True</code> to sort from biggest to smallest:</p>
+<pre><code>nums = [3, 1, 2]
+print(sorted(nums))                 # [1, 2, 3]
+print(sorted(nums, reverse=True))   # [3, 2, 1]
+print(nums)                         # [3, 1, 2] — untouched</code></pre>
+<p>(Lists also have <code>nums.sort()</code>, which sorts the list itself and returns nothing.)</p>`,
+  goal:`Print the weights sorted lightest-first, then heaviest-first, then the original list to prove it's unchanged. Expected output:
+<pre><code>[2, 4, 7, 9]
+[9, 7, 4, 2]
+[7, 2, 9, 4]</code></pre>`,
+  starter:'weights = [7, 2, 9, 4]\n# Sort two ways, then show the original\n',
+  expected:'[2, 4, 7, 9]\n[9, 7, 4, 2]\n[7, 2, 9, 4]',
+  require:[{re:/sorted\s*\(/,msg:'Use sorted() so the original list is left alone.'},
+           {re:/reverse\s*=\s*True/,msg:'Sort heaviest-first with reverse=True.'}],
+  hints:['print(sorted(weights)) for the first line.',
+         'print(sorted(weights, reverse=True)), then print(weights).'],
+  solution:'weights = [7, 2, 9, 4]\nprint(sorted(weights))\nprint(sorted(weights, reverse=True))\nprint(weights)'
+},
+{
+  id:'12-2',ch:11,xp:36,title:'By length of name',
+  brief:`<p>The stone-keeper sorts islands by how long their names are, not alphabetically. The <code>key=</code> argument tells <code>sorted()</code> what to compare: pass it a function, and each item is ranked by that function's answer. <code>max()</code> and <code>min()</code> take a <code>key=</code> too:</p>
+<pre><code>sorted(["ccc", "a", "bb"], key=len)   # ['a', 'bb', 'ccc']
+max(["ccc", "a", "bb"], key=len)      # 'ccc'</code></pre>
+<p>Notice it's <code>key=len</code>, not <code>key=len()</code> — you hand over the function itself, and Python calls it for you.</p>`,
+  goal:`Print the islands sorted shortest-name-first, then the island with the longest name. Expected output:
+<pre><code>['Ash', 'Coil', 'Rattle', 'Fangmere']
+Fangmere</code></pre>`,
+  starter:'islands = ["Coil", "Fangmere", "Rattle", "Ash"]\n# Sort by length, then find the longest\n',
+  expected:"['Ash', 'Coil', 'Rattle', 'Fangmere']\nFangmere",
+  require:[{re:/key\s*=\s*len\b/,msg:'Rank by name length with key=len.'},
+           {re:/max\s*\(/,msg:'Find the longest with max(..., key=len).'}],
+  hints:['print(sorted(islands, key=len))',
+         'print(max(islands, key=len))'],
+  solution:'islands = ["Coil", "Fangmere", "Rattle", "Ash"]\nprint(sorted(islands, key=len))\nprint(max(islands, key=len))'
+},
+{
+  id:'12-3',ch:11,xp:36,title:'The leaderboard',
+  brief:`<p>Time to rank the expedition's scouts. <code>scores.items()</code> gives <code>(name, score)</code> pairs, but sorting pairs compares the names first. A <strong>lambda</strong> is a tiny unnamed function written inline — <code>lambda pair: pair[1]</code> means "given a pair, answer with its second item":</p>
+<pre><code>pairs = [("b", 2), ("a", 9)]
+sorted(pairs, key=lambda pair: pair[1])   # [('b', 2), ('a', 9)]</code></pre>
+<p>Then a slice like <code>[:3]</code> keeps just the top three.</p>`,
+  goal:`Print the top three scouts, highest score first. Expected output:
+<pre><code>1. Cleo 98
+2. Ada 91
+3. Eli 88</code></pre>`,
+  starter:'scores = {"Ada": 91, "Bram": 78, "Cleo": 98, "Dev": 85, "Eli": 88}\n# Rank, keep three, print\n',
+  expected:'1. Cleo 98\n2. Ada 91\n3. Eli 88',
+  require:[{re:/lambda/,msg:'Sort the pairs by score with key=lambda pair: pair[1].'},
+           {re:/\[\s*:\s*3\s*\]/,msg:'Keep only the top three with a [:3] slice.'}],
+  hints:['ranked = sorted(scores.items(), key=lambda pair: pair[1], reverse=True)',
+         'for place, (name, score) in enumerate(ranked[:3], start=1): print(f"{place}. {name} {score}")'],
+  solution:'scores = {"Ada": 91, "Bram": 78, "Cleo": 98, "Dev": 85, "Eli": 88}\nranked = sorted(scores.items(), key=lambda pair: pair[1], reverse=True)\nfor place, (name, score) in enumerate(ranked[:3], start=1):\n    print(f"{place}. {name} {score}")'
+},
+// ---- Chapter XIII ----
+{
+  id:'13-1',ch:12,xp:38,title:'Default settings',
+  brief:`<p>The island foundry forges almost everything from iron. A parameter can have a <strong>default value</strong>: if the caller leaves that argument out, the default is used. Parameters with defaults go after the ones without:</p>
+<pre><code>def brew(drink, sugar=1):
+    return f"{drink} with {sugar} sugar"
+
+brew("tea")        # 'tea with 1 sugar'
+brew("tea", 3)     # 'tea with 3 sugar'</code></pre>`,
+  goal:`Define <code>forge(item, metal="iron")</code> that returns <code>"&lt;metal&gt; &lt;item&gt;"</code>. Print <code>forge("blade")</code> and <code>forge("bell", "bronze")</code>. Expected output:
+<pre><code>iron blade
+bronze bell</code></pre>`,
+  starter:'def forge(item, metal="iron"):\n    # return the forged thing\n\n# Two orders for the smith\n',
+  expected:'iron blade\nbronze bell',
+  require:[{re:/def\s+forge\s*\(\s*item\s*,\s*metal\s*=/,msg:'Define it as: def forge(item, metal="iron"):'},
+           {re:/\breturn\b/,msg:'Return the string — don\'t print inside the function.'}],
+  hints:['Inside: return f"{metal} {item}"',
+         'Then print(forge("blade")) and print(forge("bell", "bronze")).'],
+  solution:'def forge(item, metal="iron"):\n    return f"{metal} {item}"\n\nprint(forge("blade"))\nprint(forge("bell", "bronze"))'
+},
+{
+  id:'13-2',ch:12,xp:38,title:'Two answers at once',
+  brief:`<p>The foundry's thermometer logs every reading, and the smith wants the coldest and hottest. A function can return several values separated by commas — they travel back as one tuple, which you unpack on arrival:</p>
+<pre><code>def first_last(items):
+    return items[0], items[-1]
+
+a, b = first_last([4, 5, 6])   # a is 4, b is 6</code></pre>`,
+  goal:`Define <code>extremes(temps)</code> that returns the lowest and highest reading. Unpack the result into <code>lo, hi</code> and print it. Expected output: <code>low 27, high 35</code>`,
+  starter:'def extremes(temps):\n    # return two values\n\nreadings = [31, 27, 35, 29]\n# unpack and report\n',
+  expected:'low 27, high 35',
+  require:[{re:/return\s+[^\n]*,/,msg:'Return both values separated by a comma.'},
+           {re:/lo\s*,\s*hi\s*=\s*extremes/,msg:'Unpack the answer: lo, hi = extremes(readings)'}],
+  hints:['return min(temps), max(temps)',
+         'lo, hi = extremes(readings), then print(f"low {lo}, high {hi}").'],
+  solution:'def extremes(temps):\n    return min(temps), max(temps)\n\nreadings = [31, 27, 35, 29]\nlo, hi = extremes(readings)\nprint(f"low {lo}, high {hi}")'
+},
+{
+  id:'13-3',ch:12,xp:38,title:'The spiral stair',
+  brief:`<p>Beneath the foundry, a spiral stair winds down forever — or so it seems. A <strong>recursive</strong> function calls itself on a smaller problem. It needs a <em>base case</em> that stops the spiral, or it never reaches the bottom:</p>
+<pre><code>def total(n):
+    if n == 0:            # base case: the bottom step
+        return 0
+    return n + total(n - 1)
+
+print(total(4))   # 4 + 3 + 2 + 1 + 0 = 10</code></pre>`,
+  goal:`Define <code>factorial(n)</code> recursively — 1 when <code>n</code> is 1 or less, otherwise <code>n * factorial(n - 1)</code>. Print <code>factorial(5)</code> and <code>factorial(10)</code>. Expected output:
+<pre><code>120
+3628800</code></pre>`,
+  starter:'def factorial(n):\n    # base case first, then the recursive step\n\nprint(factorial(5))\nprint(factorial(10))\n',
+  expected:'120\n3628800',
+  require:[{re:/def\s+factorial\s*\(/,msg:'Define factorial(n).'},
+           {re:/factorial\s*\(\s*n\s*-\s*1\s*\)/,msg:'Have the function call itself: factorial(n - 1).'}],
+  hints:['Base case: if n <= 1: return 1',
+         'Otherwise: return n * factorial(n - 1)'],
+  solution:'def factorial(n):\n    if n <= 1:\n        return 1\n    return n * factorial(n - 1)\n\nprint(factorial(5))\nprint(factorial(10))'
+},
+// ---- Chapter XIV ----
+{
+  id:'14-1',ch:13,xp:40,title:'Weaving a pattern',
+  brief:`<p>The weavers of the loom build whole lists in a single line. A <strong>list comprehension</strong> reads like a sentence: <em>this expression, for each item in that sequence</em>:</p>
+<pre><code>doubled = [n * 2 for n in [1, 2, 3]]   # [2, 4, 6]</code></pre>
+<p>It does the same job as an empty list, a loop and <code>.append()</code> — in one line.</p>`,
+  goal:`Build the squares of 1 through 6 with a list comprehension and print them. Expected output: <code>[1, 4, 9, 16, 25, 36]</code>`,
+  starter:'# One line to weave the list\nsquares = []\nprint(squares)\n',
+  expected:'[1, 4, 9, 16, 25, 36]',
+  require:[{re:/\[[^\]\n]*\bfor\b[^\]\n]*\bin\b[^\n]*\]/,msg:'Build it with a comprehension: [... for n in ...]'}],
+  hints:['range(1, 7) gives 1 through 6.',
+         'squares = [n * n for n in range(1, 7)]'],
+  solution:'squares = [n * n for n in range(1, 7)]\nprint(squares)'
+},
+{
+  id:'14-2',ch:13,xp:40,title:'Picking the ripe fruit',
+  brief:`<p>Add an <code>if</code> to the end of a comprehension and it becomes a filter — only items that pass the test make it into the new list. Strings have a handy test for this: <code>.startswith()</code>:</p>
+<pre><code>[w for w in ["ant", "bee", "asp"] if w.startswith("a")]   # ['ant', 'asp']</code></pre>`,
+  goal:`Keep only the fruits that start with <code>"m"</code>, shouting them in uppercase. Expected output: <code>['MANGO', 'MELON', 'MAMEY']</code>`,
+  starter:'fruits = ["mango", "kiwi", "melon", "fig", "mamey"]\n# Filter and transform in one line\n',
+  expected:"['MANGO', 'MELON', 'MAMEY']",
+  require:[{re:/\bfor\b[^\n]*\bif\b/,msg:'Filter inside the comprehension: [... for f in fruits if ...]'},
+           {re:/startswith\s*\(/,msg:'Test each fruit with .startswith("m").'}],
+  hints:['The expression at the front can transform each item: f.upper()',
+         'print([f.upper() for f in fruits if f.startswith("m")])'],
+  solution:'fruits = ["mango", "kiwi", "melon", "fig", "mamey"]\nprint([f.upper() for f in fruits if f.startswith("m")])'
+},
+{
+  id:'14-3',ch:13,xp:40,title:'Day or night',
+  brief:`<p>The loom's last pattern needs a choice inside the list. A <strong>conditional expression</strong> squeezes an if/else onto one line: <code>a if condition else b</code>. And Python lets you chain comparisons, just like in maths:</p>
+<pre><code>age = 15
+label = "teen" if 13 &lt;= age &lt; 20 else "not a teen"   # 'teen'</code></pre>`,
+  goal:`For each hour, label it <code>"day"</code> if it's from 6 up to (but not including) 18, otherwise <code>"night"</code>. Use a comprehension and print the list. Expected output: <code>['day', 'day', 'night', 'night']</code>`,
+  starter:'hours = [6, 13, 21, 2]\n# One label per hour\n',
+  expected:"['day', 'day', 'night', 'night']",
+  require:[{re:/\bif\b[^\n]*\belse\b/,msg:'Choose with a conditional expression: "day" if ... else "night"'},
+           {re:/\bfor\b/,msg:'Build the list with a comprehension.'}],
+  hints:['The test is 6 <= h < 18 — a chained comparison.',
+         'print(["day" if 6 <= h < 18 else "night" for h in hours])'],
+  solution:'hours = [6, 13, 21, 2]\nprint(["day" if 6 <= h < 18 else "night" for h in hours])'
+},
+// ---- Chapter XV ----
+{
+  id:'15-1',ch:14,xp:42,title:'Bad readings',
+  brief:`<p>A storm batters the coast and scrambles the instruments. Normally an error stops your whole program. <code>try</code>/<code>except</code> catches it instead: Python runs the <code>try</code> block, and if a matching error happens, it jumps to <code>except</code> and carries on:</p>
+<pre><code>try:
+    n = int("seven")
+except ValueError:
+    print("that's not a number")</code></pre>`,
+  goal:`Add up the readings with <code>int()</code>. When one isn't a number, print <code>skipped &lt;reading&gt;</code> and keep going. Finally print the total. Expected output:
+<pre><code>skipped storm
+total: 49</code></pre>`,
+  starter:'readings = ["12", "7", "storm", "30"]\ntotal = 0\n# Convert each one, surviving the bad ones\n',
+  expected:'skipped storm\ntotal: 49',
+  require:[{re:/\btry\s*:/,msg:'Wrap the conversion in a try: block.'},
+           {re:/except\s+ValueError/,msg:'Catch the specific error: except ValueError:'}],
+  hints:['for r in readings: then, inside, try: total += int(r)',
+         'except ValueError: print(f"skipped {r}") — and print(f"total: {total}") after the loop.'],
+  solution:'readings = ["12", "7", "storm", "30"]\ntotal = 0\nfor r in readings:\n    try:\n        total += int(r)\n    except ValueError:\n        print(f"skipped {r}")\nprint(f"total: {total}")'
+},
+{
+  id:'15-2',ch:14,xp:42,title:'Dividing the catch',
+  brief:`<p>The fishing boats share the day's catch equally — unless no boats came back. Dividing by zero raises a <code>ZeroDivisionError</code>. Catch it inside the function and return a safe answer, so the caller never has to worry about it:</p>
+<pre><code>def safe_half(n, d):
+    try:
+        return n / d
+    except ZeroDivisionError:
+        return None</code></pre>`,
+  goal:`Finish <code>share(fish, boats)</code>: return <code>fish // boats</code>, or <code>0</code> if there are no boats. Expected output:
+<pre><code>5
+0</code></pre>`,
+  starter:'def share(fish, boats):\n    # divide safely\n\nprint(share(20, 4))\nprint(share(9, 0))\n',
+  expected:'5\n0',
+  require:[{re:/except\s+ZeroDivisionError/,msg:'Catch except ZeroDivisionError: inside the function.'},
+           {re:/\/\//,msg:'Share whole fish with //.'}],
+  hints:['try: return fish // boats',
+         'except ZeroDivisionError: return 0 — both lines indented inside the function.'],
+  solution:'def share(fish, boats):\n    try:\n        return fish // boats\n    except ZeroDivisionError:\n        return 0\n\nprint(share(20, 4))\nprint(share(9, 0))'
+},
+{
+  id:'15-3',ch:14,xp:42,title:'Raising the alarm',
+  brief:`<p>Sometimes <em>your</em> code should be the one to cry out. <code>raise</code> throws an error on purpose, with a message. Whoever calls the function can catch it — and <code>except ValueError as e</code> gives you the error itself, so you can print its message:</p>
+<pre><code>def check_age(n):
+    if n &lt; 0:
+        raise ValueError("age can't be negative")
+    return n
+
+try:
+    check_age(-3)
+except ValueError as e:
+    print(e)    # age can't be negative</code></pre>`,
+  goal:`Make <code>set_sail(wind)</code> raise a <code>ValueError</code> with the message <code>wind too strong: &lt;wind&gt;</code> when the wind is above 40, and return <code>"sailing"</code> otherwise. In the loop, catch it and print <code>Stay ashore: &lt;message&gt;</code>. Expected output:
+<pre><code>sailing
+Stay ashore: wind too strong: 55</code></pre>`,
+  starter:'def set_sail(wind):\n    # raise if the wind is above 40\n    return "sailing"\n\nfor wind in [12, 55]:\n    # try to sail, catch the alarm\n    print(set_sail(wind))\n',
+  expected:'sailing\nStay ashore: wind too strong: 55',
+  require:[{re:/raise\s+ValueError\s*\(/,msg:'Raise the alarm with raise ValueError(...).'},
+           {re:/except\s+ValueError\s+as\s+\w+/,msg:'Catch it with except ValueError as e: so you can print the message.'}],
+  hints:['In the function: if wind > 40: raise ValueError(f"wind too strong: {wind}")',
+         'In the loop: try: print(set_sail(wind)) / except ValueError as e: print(f"Stay ashore: {e}")'],
+  solution:'def set_sail(wind):\n    if wind > 40:\n        raise ValueError(f"wind too strong: {wind}")\n    return "sailing"\n\nfor wind in [12, 55]:\n    try:\n        print(set_sail(wind))\n    except ValueError as e:\n        print(f"Stay ashore: {e}")'
+},
+// ---- Chapter XVI ----
+{
+  id:'16-1',ch:15,xp:45,title:'Blueprint for a canoe',
+  brief:`<p>The Guild of Makers works from blueprints. A <strong>class</strong> is a blueprint; each thing you build from it is an <em>object</em>. The special method <code>__init__</code> runs when an object is built, and <code>self</code> is the object being built — store its details as <code>self.something</code>:</p>
+<pre><code>class Tent:
+    def __init__(self, colour, beds):
+        self.colour = colour
+        self.beds = beds
+
+t = Tent("green", 2)
+print(t.colour)    # green</code></pre>`,
+  goal:`Write the <code>Canoe</code> class so each canoe stores its <code>name</code> and <code>seats</code>. The code below builds two and prints them. Expected output:
+<pre><code>Heron seats 4
+Otter seats 2</code></pre>`,
+  starter:'class Canoe:\n    def __init__(self, name, seats):\n        # store both details on self\n\nheron = Canoe("Heron", 4)\notter = Canoe("Otter", 2)\nfor c in [heron, otter]:\n    print(f"{c.name} seats {c.seats}")\n',
+  expected:'Heron seats 4\nOtter seats 2',
+  require:[{re:/class\s+Canoe/,msg:'Keep the class Canoe: blueprint.'},
+           {re:/self\.name\s*=/,msg:'Store the name: self.name = name'},
+           {re:/self\.seats\s*=/,msg:'Store the seats: self.seats = seats'}],
+  hints:['Inside __init__, indented twice: self.name = name',
+         'And on the next line: self.seats = seats'],
+  solution:'class Canoe:\n    def __init__(self, name, seats):\n        self.name = name\n        self.seats = seats\n\nheron = Canoe("Heron", 4)\notter = Canoe("Otter", 2)\nfor c in [heron, otter]:\n    print(f"{c.name} seats {c.seats}")'
+},
+{
+  id:'16-2',ch:15,xp:45,title:'The lantern’s fuel',
+  brief:`<p>Objects don't just hold data — they <em>do</em> things. A <strong>method</strong> is a function inside a class. Its first parameter is always <code>self</code>, so it can read and change that object's own details:</p>
+<pre><code>class Counter:
+    def __init__(self):
+        self.count = 0
+    def bump(self):
+        self.count += 1
+
+c = Counter()
+c.bump()
+print(c.count)   # 1</code></pre>`,
+  goal:`Add two methods to <code>Lantern</code>: <code>burn(hours)</code> uses up that much fuel but never goes below 0, and <code>is_lit()</code> returns whether any fuel is left. Expected output:
+<pre><code>2 True
+0 False</code></pre>`,
+  starter:'class Lantern:\n    def __init__(self, fuel):\n        self.fuel = fuel\n\n    # add burn(self, hours) and is_lit(self) here\n\nlamp = Lantern(5)\nlamp.burn(3)\nprint(lamp.fuel, lamp.is_lit())\nlamp.burn(4)\nprint(lamp.fuel, lamp.is_lit())\n',
+  expected:'2 True\n0 False',
+  require:[{re:/def\s+burn\s*\(\s*self\s*,/,msg:'Define burn(self, hours) inside the class.'},
+           {re:/def\s+is_lit\s*\(\s*self\s*\)/,msg:'Define is_lit(self) inside the class.'}],
+  hints:['burn: self.fuel = max(0, self.fuel - hours) — max picks 0 if the result would go negative.',
+         'is_lit: return self.fuel > 0. Both methods are indented one level, like __init__.'],
+  solution:'class Lantern:\n    def __init__(self, fuel):\n        self.fuel = fuel\n\n    def burn(self, hours):\n        self.fuel = max(0, self.fuel - hours)\n\n    def is_lit(self):\n        return self.fuel > 0\n\nlamp = Lantern(5)\nlamp.burn(3)\nprint(lamp.fuel, lamp.is_lit())\nlamp.burn(4)\nprint(lamp.fuel, lamp.is_lit())'
+},
+{
+  id:'16-3',ch:15,xp:45,title:'A name on the hull',
+  brief:`<p>Print an object and you get something unhelpful like <code>&lt;__main__.Ship object&gt;</code>. Define <code>__str__</code> and Python uses <em>your</em> text whenever the object is printed or put in an f-string:</p>
+<pre><code>class Tent:
+    def __init__(self, colour):
+        self.colour = colour
+    def __str__(self):
+        return f"a {self.colour} tent"
+
+print(Tent("red"))   # a red tent</code></pre>`,
+  goal:`Finish <code>Ship</code>: <code>add(person)</code> appends to the crew list, and <code>__str__</code> returns <code>&lt;name&gt; (&lt;n&gt; aboard)</code>. Expected output:
+<pre><code>Serpent (0 aboard)
+Serpent (2 aboard)</code></pre>`,
+  starter:'class Ship:\n    def __init__(self, name):\n        self.name = name\n        self.crew = []\n\n    # add(self, person) and __str__(self) go here\n\nship = Ship("Serpent")\nprint(ship)\nship.add("Ada")\nship.add("Bram")\nprint(ship)\n',
+  expected:'Serpent (0 aboard)\nSerpent (2 aboard)',
+  require:[{re:/def\s+add\s*\(\s*self\s*,/,msg:'Define add(self, person).'},
+           {re:/def\s+__str__\s*\(\s*self\s*\)/,msg:'Define __str__(self) — two underscores on each side.'},
+           {re:/\.append\s*\(/,msg:'add() should append to self.crew.'}],
+  hints:['def add(self, person): self.crew.append(person)',
+         'def __str__(self): return f"{self.name} ({len(self.crew)} aboard)"'],
+  solution:'class Ship:\n    def __init__(self, name):\n        self.name = name\n        self.crew = []\n\n    def add(self, person):\n        self.crew.append(person)\n\n    def __str__(self):\n        return f"{self.name} ({len(self.crew)} aboard)"\n\nship = Ship("Serpent")\nprint(ship)\nship.add("Ada")\nship.add("Bram")\nprint(ship)'
+},
+// ---- Chapter XVII ----
+{
+  id:'17-1',ch:16,xp:48,title:'Coins and decimals',
+  brief:`<p>The cartographers sell their maps for coins, and their price tags must look neat. Inside an f-string, a colon starts a <strong>format spec</strong>. <code>.2f</code> means "a decimal number with exactly 2 digits after the point":</p>
+<pre><code>price = 4.5
+print(f"{price:.2f}")     # 4.50
+print(f"{1/3:.3f}")       # 0.333</code></pre>`,
+  goal:`Print each price with two decimals and the word <code>coins</code>, then the total the same way. Expected output:
+<pre><code>3.50 coins
+12.25 coins
+0.99 coins
+total: 16.74 coins</code></pre>`,
+  starter:'prices = [3.5, 12.25, 0.99]\n# Neat price tags, then the total\n',
+  expected:'3.50 coins\n12.25 coins\n0.99 coins\ntotal: 16.74 coins',
+  require:[{re:/:\s*\.2f/,msg:'Format with two decimals: {p:.2f}'},
+           {re:/\bfor\b/,msg:'Loop over the prices.'}],
+  hints:['for p in prices: print(f"{p:.2f} coins")',
+         'After the loop: print(f"total: {sum(prices):.2f} coins")'],
+  solution:'prices = [3.5, 12.25, 0.99]\nfor p in prices:\n    print(f"{p:.2f} coins")\nprint(f"total: {sum(prices):.2f} coins")'
+},
+{
+  id:'17-2',ch:16,xp:48,title:'The tide table',
+  brief:`<p>A good table lines up in columns. Format specs can pad a value to a width: <code>&lt;</code> aligns left, <code>&gt;</code> aligns right, <code>^</code> centres. You can combine a width with decimals too:</p>
+<pre><code>print(f"[{'ab':&lt;5}]")      # [ab   ]
+print(f"[{'ab':&gt;5}]")      # [   ab]
+print(f"[{3.14159:&gt;7.2f}]") # [   3.14]</code></pre>`,
+  goal:`Print a header, then each port left-aligned in 10 characters and its tide height right-aligned in 6 with one decimal. Expected output:
+<pre><code>PORT        FEET
+Coilhaven    3.4
+Fangmere    12.0
+Ash Rock     0.6</code></pre>`,
+  starter:'tides = [("Coilhaven", 3.4), ("Fangmere", 12.0), ("Ash Rock", 0.6)]\nprint(f"{\'PORT\':<10}{\'FEET\':>6}")\n# One aligned row per port\n',
+  expected:'PORT        FEET\nCoilhaven    3.4\nFangmere    12.0\nAsh Rock     0.6',
+  require:[{re:/:\s*<\s*10/,msg:'Left-align the port name in 10 characters: {place:<10}'},
+           {re:/:\s*>\s*6\.1f/,msg:'Right-align the height in 6 with one decimal: {height:>6.1f}'}],
+  hints:['for place, height in tides: — each item is a (name, height) tuple, so unpack it.',
+         'print(f"{place:<10}{height:>6.1f}") — no space between the two fields.'],
+  solution:'tides = [("Coilhaven", 3.4), ("Fangmere", 12.0), ("Ash Rock", 0.6)]\nprint(f"{\'PORT\':<10}{\'FEET\':>6}")\nfor place, height in tides:\n    print(f"{place:<10}{height:>6.1f}")'
+},
+{
+  id:'17-3',ch:16,xp:48,title:'Doubling the hoard',
+  brief:`<p>A legend says a single coin left at the shrine doubles every day. How long until the hoard reaches 1,000? When you don't know how many passes you need, a common pattern is <code>while True</code> — loop forever — with a <code>break</code> that jumps out the moment you're done:</p>
+<pre><code>n = 1
+while True:
+    n *= 3
+    if n &gt; 50:
+        break
+print(n)   # 81</code></pre>`,
+  goal:`Start with 1 coin. Each day, double the coins and count the day. Stop as soon as there are at least 1,000 coins. Expected output: <code>10 days: 1024 coins</code>`,
+  starter:'coins = 1\ndays = 0\n# Loop until the hoard is big enough\n',
+  expected:'10 days: 1024 coins',
+  require:[{re:/while\s+True\s*:/,msg:'Use the while True: pattern.'},
+           {re:/\bbreak\b/,msg:'Jump out of the loop with break.'}],
+  hints:['Inside the loop: coins *= 2 and days += 1, then if coins >= 1000: break',
+         'After the loop: print(f"{days} days: {coins} coins")'],
+  solution:'coins = 1\ndays = 0\nwhile True:\n    coins *= 2\n    days += 1\n    if coins >= 1000:\n        break\nprint(f"{days} days: {coins} coins")'
+},
+// ---- Chapter XVIII ----
+{
+  id:'18-1',ch:17,xp:50,title:'The quartermaster’s inventory',
+  brief:`<p>The last stretch of the expedition asks you to combine everything. The quartermaster needs an inventory object: a class that keeps a dictionary inside it, with methods that update it — and an alarm when someone asks for more than there is.</p>
+<p>No new syntax here — you've used every piece already: <code>self</code>, <code>.get(key, 0)</code>, <code>raise ValueError</code>, and <code>sorted()</code>. Looping over a dictionary (or sorting it) walks its keys.</p>`,
+  goal:`Fill in <code>add</code>, <code>remove</code> and <code>report</code>. <code>remove</code> must raise <code>ValueError("not enough &lt;name&gt;")</code> when there are fewer than <code>qty</code>; <code>report</code> prints every item with a count above zero, alphabetically, as <code>name: count</code> (the lamp drops to 0, so it stays hidden). Expected output:
+<pre><code>not enough salt
+rope: 4</code></pre>`,
+  starter:'class Inventory:\n    def __init__(self):\n        self.items = {}\n\n    def add(self, name, qty=1):\n        pass  # grow the count\n\n    def remove(self, name, qty=1):\n        pass  # raise ValueError if there are too few, else shrink\n\n    def report(self):\n        pass  # print items with a count above 0, alphabetically\n\ninv = Inventory()\ninv.add("rope", 3)\ninv.add("lamp")\ninv.add("rope")\ninv.remove("lamp")\ntry:\n    inv.remove("salt")\nexcept ValueError as e:\n    print(e)\ninv.report()\n',
+  expected:'not enough salt\nrope: 4',
+  require:[{re:/\.get\s*\(/,msg:'Use self.items.get(name, 0) so new items start at zero.'},
+           {re:/raise\s+ValueError\s*\(/,msg:'remove() should raise ValueError(f"not enough {name}").'},
+           {re:/sorted\s*\(/,msg:'Report alphabetically with sorted().'}],
+  hints:['add: self.items[name] = self.items.get(name, 0) + qty. remove: if self.items.get(name, 0) < qty: raise ValueError(f"not enough {name}") — otherwise subtract qty.',
+         'report: for name in sorted(self.items): and inside, if self.items[name] > 0: print(f"{name}: {self.items[name]}")'],
+  solution:'class Inventory:\n    def __init__(self):\n        self.items = {}\n\n    def add(self, name, qty=1):\n        self.items[name] = self.items.get(name, 0) + qty\n\n    def remove(self, name, qty=1):\n        if self.items.get(name, 0) < qty:\n            raise ValueError(f"not enough {name}")\n        self.items[name] -= qty\n\n    def report(self):\n        for name in sorted(self.items):\n            if self.items[name] > 0:\n                print(f"{name}: {self.items[name]}")\n\ninv = Inventory()\ninv.add("rope", 3)\ninv.add("lamp")\ninv.add("rope")\ninv.remove("lamp")\ntry:\n    inv.remove("salt")\nexcept ValueError as e:\n    print(e)\ninv.report()'
+},
+{
+  id:'18-2',ch:17,xp:50,title:'The serpent cipher',
+  brief:`<p>The gate to the final temple only opens for a message in the old serpent cipher: every letter slides a few places along the alphabet, wrapping from <code>z</code> back to <code>a</code>. Every character has a number — <code>ord()</code> turns a letter into its number and <code>chr()</code> turns a number back into a letter:</p>
+<pre><code>ord("a")    # 97
+chr(98)     # 'b'
+(25 + 3) % 26   # 2 — modulo wraps past the end of the alphabet</code></pre>`,
+  goal:`Write <code>shift(text, n)</code> that slides each lowercase letter <code>n</code> places (leaving spaces alone), then encode the message and decode it again. Expected output:
+<pre><code>phhw dw wkh idoov
+meet at the falls</code></pre>`,
+  starter:'def shift(text, n):\n    result = ""\n    for ch in text:\n        # letters slide, everything else stays\n    return result\n\nmessage = "meet at the falls"\nsecret = shift(message, 3)\nprint(secret)\nprint(shift(secret, -3))\n',
+  expected:'phhw dw wkh idoov\nmeet at the falls',
+  require:[{re:/ord\s*\(/,msg:'Turn each letter into a number with ord().'},
+           {re:/chr\s*\(/,msg:'Turn the shifted number back into a letter with chr().'},
+           {re:/%\s*26/,msg:'Wrap around the alphabet with % 26.'}],
+  hints:['Position in the alphabet: ord(ch) - ord("a") (0 for a, 25 for z). Shift it, wrap it: (pos + n) % 26.',
+         'if ch.isalpha(): result += chr((ord(ch) - ord("a") + n) % 26 + ord("a")) — else: result += ch'],
+  solution:'def shift(text, n):\n    result = ""\n    for ch in text:\n        if ch.isalpha():\n            result += chr((ord(ch) - ord("a") + n) % 26 + ord("a"))\n        else:\n            result += ch\n    return result\n\nmessage = "meet at the falls"\nsecret = shift(message, 3)\nprint(secret)\nprint(shift(secret, -3))'
+},
+{
+  id:'18-3',ch:17,xp:50,title:'The crown of the isles',
+  brief:`<p>The temple's inner sanctum holds the expedition's own logbook. To claim the Serpent's Crown, analyse it: clean the words, count them, find the longest, and rank the most common. Strings, comprehensions, dictionaries, <code>max</code> with a <code>key</code>, sorting with a <code>lambda</code>, slicing — the whole expedition in one program.</p>
+<p>One new helper: <code>.strip(".,")</code> trims those characters off both ends of a word, so <code>"east."</code> becomes <code>"east"</code>.</p>`,
+  goal:`Print the number of words, the number of different words, the longest word, and the three most common words with their counts (most common first; ties keep the order they first appeared). Expected output:
+<pre><code>words: 13
+unique: 8
+longest: jungle
+the: 3
+ran: 3
+river: 2</code></pre>`,
+  starter:'log = "The river ran east. The jungle ran thick, and the river ran deep."\nwords = [w.strip(".,").lower() for w in log.split()]\ncounts = {}\n# count, then report\n',
+  expected:'words: 13\nunique: 8\nlongest: jungle\nthe: 3\nran: 3\nriver: 2',
+  require:[{re:/\.get\s*\(|counts\s*\[\s*\w+\s*\]\s*\+=/,msg:'Tally the words into the counts dictionary.'},
+           {re:/max\s*\([^\n]*key\s*=/,msg:'Find the longest word with max(words, key=len).'},
+           {re:/sorted\s*\([^\n]*lambda/,msg:'Rank with sorted(counts.items(), key=lambda pair: pair[1], reverse=True).'}],
+  hints:['Tally like the bird census: counts[w] = counts.get(w, 0) + 1. Then words: len(words), unique: len(counts), longest: max(words, key=len).',
+         'top = sorted(counts.items(), key=lambda pair: pair[1], reverse=True)[:3], then for word, n in top: print(f"{word}: {n}")'],
+  solution:'log = "The river ran east. The jungle ran thick, and the river ran deep."\nwords = [w.strip(".,").lower() for w in log.split()]\ncounts = {}\nfor w in words:\n    counts[w] = counts.get(w, 0) + 1\nprint(f"words: {len(words)}")\nprint(f"unique: {len(counts)}")\nprint(f"longest: {max(words, key=len)}")\ntop = sorted(counts.items(), key=lambda pair: pair[1], reverse=True)[:3]\nfor word, n in top:\n    print(f"{word}: {n}")'
+},
 ];
 
-const RANKS=[[0,'Hatchling'],[30,'Deck Scout'],[70,'Pathfinder'],[120,'Trailblazer'],[180,'Ridge Ranger'],[250,'Cave Delver'],[330,'Serpent Sage'],[450,'Pythonista']];
+const RANKS=[[0,'Hatchling'],[30,'Deck Scout'],[70,'Pathfinder'],[120,'Trailblazer'],[180,'Ridge Ranger'],
+  [250,'Cave Delver'],[330,'Wilds Walker'],[450,'Jungle Heart'],[560,'Archive Keeper'],[700,'Ledger Master'],
+  [850,'Loom Weaver'],[1010,'Storm Rider'],[1180,'Guild Maker'],[1400,'Serpent Sage'],[1635,'Pythonista']];
 const TOTAL_XP=LEVELS.reduce((a,l)=>a+l.xp,0);
 
 /* ---------- pet companion ---------- */
-const PET_STAGES=[[0,'Mysterious Egg'],[1,'Hatchling'],[4,'Garden Noodle'],[8,'Vine Viper'],[12,'River Boa'],[17,'Ridge Python'],[24,'Golden Python']];
+const PET_STAGES=[[0,'Mysterious Egg'],[1,'Hatchling'],[4,'Garden Noodle'],[8,'Vine Viper'],[12,'River Boa'],
+  [17,'Ridge Python'],[24,'Jungle Python'],[30,'Archive Adder'],[36,'Loom Serpent'],[42,'Storm Serpent'],
+  [48,'Ancient Python'],[54,'Golden Python']];
 function petStage(n){let s=PET_STAGES[0];for(const st of PET_STAGES)if(n>=st[0])s=st;return s;}
 function petNextStage(n){for(const st of PET_STAGES)if(st[0]>n)return st;return null;}
 function petSVG(n){
@@ -1469,7 +2921,7 @@ function petSVG(n){
   const golden=n>=PET_STAGES[PET_STAGES.length-1][0];
   const segs=Math.min(n,24);
   const len=Math.min(46+segs*6.5,W-26);
-  const amp=6+stageIdx*1.4;
+  const amp=6+stageIdx*0.75;
   const waves=1.2+segs*0.11;
   const x0=8;
   const pts=[];
@@ -1481,8 +2933,8 @@ function petSVG(n){
     pts.push(hx.toFixed(1)+','+hy.toFixed(1));
   }
   const col=golden?'#f2b33d':'#4fbf8b';
-  const sw=(3+stageIdx*0.8).toFixed(1);
-  const hr=(4.5+stageIdx*0.8).toFixed(1);
+  const sw=(3+stageIdx*0.45).toFixed(1);
+  const hr=(4.5+stageIdx*0.45).toFixed(1);
   return `<svg viewBox="0 0 ${W} ${H}" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Your snake companion, ${petStage(n)[1]}, ${segs} segments long">
     <polyline points="${pts.join(' ')}" fill="none" stroke="${col}" stroke-width="${sw}" stroke-linecap="round" stroke-linejoin="round" opacity="0.95"/>
     <circle cx="${hx.toFixed(1)}" cy="${hy.toFixed(1)}" r="${hr}" fill="${col}"/>
@@ -1643,7 +3095,7 @@ function renderHero(){
   const done=state.solved.length;
   mainEl.innerHTML=`
   <div class="hero">
-    <p class="eyebrow">An interactive field course · 8 chapters · 24 challenges</p>
+    <p class="eyebrow">An interactive field course · ${CHAPTERS.length} chapters · ${LEVELS.length} challenges</p>
     <h1>Learn Python by<br>charting the<br>Serpent Isles<span class="cursor"></span></h1>
     <p>Every challenge is real code, run by a real interpreter, right here on this page.
     You'll write it, run it, break it, and fix it — earning XP from Hatchling to Pythonista.</p>
@@ -1652,6 +3104,9 @@ function renderHero(){
       <span class="g">&gt;&gt;&gt;</span> if / elif / else, comparisons<br>
       <span class="g">&gt;&gt;&gt;</span> for &amp; while loops, range(), modulo<br>
       <span class="g">&gt;&gt;&gt;</span> strings, lists, functions, FizzBuzz<br>
+      <span class="g">&gt;&gt;&gt;</span> slicing, dictionaries, tuples, sorting<br>
+      <span class="g">&gt;&gt;&gt;</span> comprehensions, recursion, try / except<br>
+      <span class="g">&gt;&gt;&gt;</span> classes, objects, formatting, ciphers<br>
       <span class="y">### raise a snake companion from egg to Golden Python</span><br>
       <span class="y">### no installs · progress saves in your browser</span>
     </div>
@@ -1670,12 +3125,13 @@ function renderFinish(){
     <h1 class="title">The Serpent Isles are charted.</h1>
     <p class="bigrank">RANK: PYTHONISTA — ${state.xp} XP</p>
     <div class="brief">
-    <p>Twenty-four challenges, eight chapters, and every line of it real Python. You've covered
-    the foundations most beginner courses spend weeks on: output, variables, strings and their
-    methods, arithmetic and modulo, branching, for and while loops, lists, and functions —
-    and your companion reached its final golden form.</p>
-    <p>Where to next? The <strong>Playground</strong> on the map is yours — try combining
-    everything: a function that loops over a list, an f-string report of the results.
+    <p>${LEVELS.length} challenges, ${CHAPTERS.length} chapters, and every line of it real Python. You've covered
+    far more than most beginner courses: output, variables, strings and slicing, arithmetic,
+    branching, for and while loops, lists, dictionaries and tuples, sorting with keys and lambdas,
+    comprehensions, functions with defaults and recursion, error handling, and classes with
+    methods — and your companion reached its final golden form.</p>
+    <p>Where to next? The <strong>Playground</strong> on the map is yours — try building
+    something of your own: a class that keeps a dictionary, a word counter, a cipher of your own design.
     When you're ready for the mainland, install real Python from
     <code>python.org</code> and everything you wrote here works exactly the same.</p>
     </div>
@@ -1849,7 +3305,7 @@ function renderPlayground(){
     <h1 class="title">The Playground</h1>
     <div class="brief"><p>No objective, no checker — just you and the interpreter. Everything from
     the expedition works here: variables, f-strings, <code>if</code>/<code>elif</code>/<code>else</code>,
-    loops, lists, and functions.</p></div>
+    loops, lists, dictionaries, tuples, comprehensions, functions, <code>try</code>/<code>except</code>, and classes.</p></div>
     ${benchHTML(draft!==undefined?draft:'# The island is yours.\nfor i in range(3):\n    print(f"echo {i}")\n')}`;
   const ta=$('#code');editorSetup(ta);
   ta.addEventListener('input',()=>{state.drafts['playground']=ta.value;save();});
